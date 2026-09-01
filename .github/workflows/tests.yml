@@ -37,9 +37,10 @@ jobs:
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
     runs-on: ubuntu-latest
 
-    # A cache driver lives or dies by the framework contract it implements, and
-    # that contract moves. The matrix is the framework versions the manifest
-    # claims, on the PHP versions each of them supports.
+    # A queue driver lives or dies by the framework contract it implements, and
+    # that contract moves - Queue gained pendingSize/delayedSize/reservedSize
+    # between the versions in this matrix. It is the framework versions the
+    # manifest claims, on the PHP versions each of them supports.
     strategy:
       fail-fast: false
       matrix:
