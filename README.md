@@ -36,6 +36,23 @@ That is a promise you make, not a check that was performed. What the driver *can
 see is the damage afterwards — the ids are dense, so a run of holes where jobs
 should be is unmistakable, and it throws rather than quietly skipping.
 
+**Nothing may flush the server.** Rostam v0.6.0 added a `flush` op, and it is not
+Redis's `FLUSHDB`: it has no unit smaller than the whole keyspace, so one call
+destroys every queued job along with everything else on that server. Measured
+against v0.6.0, a `flush` sent carrying the key `app:` still removed `session:b`
+— the argument scopes nothing.
+
+That is reachable by accident rather than only by malice: the Rostam **cache**
+driver can be configured with `'flush' => 'server'`, and then an ordinary
+`php artisan cache:clear` issues exactly this op. Jobs the queue had already
+accepted disappear, and no worker ever learns they existed. Keep the queue on a
+server nothing flushes, or leave the cache driver on its default generational
+flush, which does not touch these keys.
+
+Like the eviction policy above, this driver **cannot detect it**: nothing on the
+wire reports that a flush happened, and a wiped queue is indistinguishable from
+an empty one.
+
 ## Requirements
 
 - PHP 8.2+
