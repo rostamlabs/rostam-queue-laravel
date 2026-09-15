@@ -27,8 +27,8 @@ A queue is only as durable as the node never throwing away a record it still hol
 A single-node `rostam-server` throws them away in two ways, both measured:
 
 - **At capacity**, silently — every write still answers success. On v0.7.0-beta6
-  with a 256 MiB budget, 400 one-megabyte writes all succeeded and **235 read
-  back**.
+  with a 256 MiB budget on one shard, 400 writes of 1,000,000 bytes all succeeded
+  and **235 read back**.
 - **With room to spare**, by default. Eviction follows write order: a record that
   sits still while newer writes churn past it is evicted when the buffer wraps,
   however little else is live. On v0.7.0-beta7 with a 32 MiB budget, put-then-delete
@@ -93,12 +93,15 @@ these keys.
 
 ### How large a job can be
 
-A job's payload is one value, and a value has to fit in one page of the server's
-cache. The page size follows from `max_memory` spread across the shards, and on a
-default single-node server it is small: the largest value stored was **about 1 MiB**
-on v0.6.0 and v0.7.0-beta6. A larger job fails at `push` with the server's generic
-`internal error`. Keep payloads small — pass ids, not models — or give the server
-fewer shards or more memory.
+A job's payload is one value, and an entry has to fit in one page of the server's
+cache — where the page bounds **the key and the value together**. The page size
+follows from `max_memory` spread across the shards, and on a default single-node
+server it is small: `strlen($key) + strlen($value)` reached **1,048,550 bytes on
+v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**, constant across key lengths.
+The key here is the queue's own (`{prefix}{queue}:job:{id}`), so nearly all of it
+is yours. A larger job fails at `push` with the server's generic `internal error`.
+Keep payloads small — pass ids, not models — or give the server fewer shards or
+more memory.
 
 ## Requirements
 
@@ -127,6 +130,7 @@ composer require rostamlabs/rostam-queue-laravel
     'queue'         => 'default',
     'retry_after'   => 90,            // the lease; longer than your longest job
     'at_cap_policy' => 'headroom',    // required - see above
+    'on_evictions'  => 'refuse',      // or 'ignore' - see below
     'after_commit'  => false,         // Laravel's own option
     'verify_every'  => 60,            // seconds between eviction checks
     'sweep_seconds' => 60,            // delayed seconds one pop may move
@@ -134,6 +138,20 @@ composer require rostamlabs/rostam-queue-laravel
     'tombstone_ttl' => 604800,        // how long a killed slot stays killed
 ],
 ```
+
+**`tombstone_ttl` must be longer than `retry_after`**, and the connector refuses a
+pair that is not. A killed slot is what stops a push from landing in a slot the
+queue has moved past, and a lease — including a dead worker's — lasts
+`retry_after`; a tombstone that expires first lets a slot be re-used while its
+lease is still held.
+
+**`on_evictions`** decides what the eviction check does when it finds something.
+`refuse` (the default) is the safe answer and an unforgiving one: the count is
+node-wide, so a co-tenant's evicted cache key stops this queue too, and a worker
+that has refused keeps refusing until it restarts — while the count itself only
+resets when the *server* restarts, which on a node without `-data` takes the
+backlog with it. Set it to `ignore` on a node whose eviction count is somebody
+else's, and accept that this queue will not notice the day it loses a job.
 
 The server itself is described once, under `rostam.connections`, shared with
 [`rostamlabs/rostam-cache-laravel`](https://github.com/rostamlabs/rostam-cache-laravel)
@@ -173,8 +191,11 @@ worker holds it, so a worker that dies does not take the work with it:
 The middle row is what every other driver needs a reservation index for, and finding
 expired reservations normally needs a scan this engine does not have. It does not
 need one: **the ids are dense, so walking them is the index.** Each pop reads a
-window of `reclaim_batch` ids in two round trips and looks past jobs still running,
-so one long job does not hold back the redelivery of abandoned ones above it.
+window of `reclaim_batch` ids in two round trips and looks past jobs still
+running, so one long job does not hold back the abandoned ones above it *within
+that window*. The cursor stops behind anything unsettled, so work more than
+`reclaim_batch` ids above a job that is still running waits for it to finish.
+Nothing is lost by waiting: the payload and its lapsed lease stay as they are.
 
 **Every step that decides something is one atomic op.** Each job this driver has
 ever lost was lost in the gap between two round trips, and each gap is closed by
@@ -192,9 +213,14 @@ deciding with a single op rather than checking and then acting.
   original is removed, so a worker dying in between leaves two, never none.
 - **`release()` writes the retry before finishing the original**, for the same
   reason.
-- **`clear()` overwrites each waiting slot with a tombstone** instead of deleting
-  it, so a push that drew one of those ids finds it killed and lands after the
-  clear, where it is delivered.
+- **`clear()` overwrites each slot with a tombstone** instead of deleting it, so a
+  push that drew one of those ids finds it killed and lands after the clear, where
+  it is delivered. It starts at the redelivery cursor rather than the reader, so a
+  job whose worker died — which sits *below* the reader, waiting to be handed back
+  — is cleared and counted like any other, instead of reappearing minutes after the
+  queue reported itself empty. It is the one place this driver overwrites a payload,
+  which is what clearing a queue is; a job a worker is running finishes normally,
+  since that worker already holds it. The walk costs two round trips per 512 ids.
 
 **Delayed jobs wait in per-second buckets**, and each `pop` moves the seconds that
 have come due. The same rules apply there:
@@ -204,7 +230,9 @@ have come due. The same rules apply there:
 - a job due in the past goes straight to the ready queue;
 - a push that stored its job **checks the watermark afterwards**, and if the sweep
   has passed its second, moves the job itself — so no pause of a producer, however
-  long, strands a delayed job;
+  long, strands a delayed job. If that move loses its lease to a worker that died
+  mid-move, the push puts the job on the ready queue instead rather than trusting
+  the lease holder to come back;
 - a delayed job is **copied, then deleted**, under a per-job move lease, and read
   again under it; a second is marked done only once every job in it has moved, and
   its counter is deleted then;
@@ -226,8 +254,10 @@ of seconds in one.
 - **Duplicates.** A crash between writing a copy and removing an original leaves
   both, and a slow worker's job may be redelivered. At-least-once allows both.
 - **A job enqueued while `clear()` is running** may land on either side of it.
-- **Keys left by a crash.** A worker killed between marking a delayed second done
-  and deleting its counter leaves that one small key behind.
+- **Keys that stay.** The cursors (`head`, `tail`, `reclaim`, `swept`, `dgen`) and
+  a delayed generation's gauge have no TTL — they are the queue. A worker killed
+  between marking a delayed second done and deleting its counter leaves that one
+  small key behind too.
 
 ## Monitoring
 
@@ -270,7 +300,10 @@ Every race this driver has lost jobs to has a test that drives that exact
 interleaving — a push caught between its id and its payload, a worker killed while
 moving a delayed job, a clear finishing under a sweep — through a client that can
 stop the world between any two round trips. Each of those tests fails if its hook
-never fires, and each fix is checked by reverting it and watching a test go red.
+never fires, and every fix is checked by reverting it and watching a test go red —
+22 of them at the last count. Where two guards overlap by design (a delayed job is
+both sealed out of a swept second and moved by its own push), reverting one alone
+leaves the other holding, and the pair is checked together.
 
 Against a real server, a chaos test runs producers and workers as separate
 processes and kills workers at random instants, then asserts that every job a

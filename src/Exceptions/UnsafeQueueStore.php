@@ -51,7 +51,8 @@ class UnsafeQueueStore extends RuntimeException
     public static function clusterUnsupported(): self
     {
         return new self(
-            'at_cap_policy "reject_writes" - a replicated -cluster - is not supported. A cluster refuses '
+            'at_cap_policy "reject_writes" names what a replicated -cluster does, and this driver does '
+            .'not support one. A cluster refuses '
             .'writes at capacity instead of evicting, but it answers a read from whichever replica '
             .'received it, and this driver reads a job\'s absence as that job being finished: a lagging '
             .'replica would drop a job without a sound. Run the queue on a single rostam-server with '
@@ -80,6 +81,32 @@ class UnsafeQueueStore extends RuntimeException
             .'checked can evict jobs without a sound. Upgrade the server. (This is asked again on the '
             .'next operation, so a server that failed to answer once is not refused for good.)'
         );
+    }
+
+    public static function tombstonesOutliveLeases(int $tombstoneTtl, int $retryAfter): self
+    {
+        return new self(sprintf(
+            'rostam queue: tombstone_ttl (%d) must be longer than retry_after (%d).'
+            ."\n\n"
+            .'A killed slot is what stops a push, or a delayed job\'s bucket slot, from coming back to '
+            .'life after the queue has moved past it - and a lease lasts retry_after, including the '
+            .'lease of a worker that died holding it. With the shorter of the two on the tombstone, a '
+            .'slot can be re-used while that lease is still held, and the job written into it is the '
+            .'one nothing comes back for.',
+            $tombstoneTtl,
+            $retryAfter,
+        ));
+    }
+
+    public static function unknownEvictionPolicy(string $given): self
+    {
+        return new self(sprintf(
+            'rostam queue: on_evictions must be "refuse" or "ignore", got "%s". "refuse" (the default) '
+            .'stops the queue when the node reports it has evicted live records; "ignore" runs without '
+            .'the check, which is only reasonable on a node whose eviction count is somebody else\'s - '
+            .'and accepts that this queue will not notice the day it loses a job.',
+            $given,
+        ));
     }
 
     public static function noConnection(string $name): self

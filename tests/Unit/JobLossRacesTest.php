@@ -188,14 +188,15 @@ class JobLossRacesTest extends TestCase
     }
 
     /**
-     * The interleaving the seal exists for, which a tombstone cannot cover.
-     *
      * The push checked the watermark and found its second still ahead, then the
      * sweep read that second's id counter, found nothing, and finished it - and
      * only then did the push draw its id. That id was never going to be looked
-     * at: the sweep had counted before it existed. Sealing the counter as the
-     * sweep passes it means an id drawn afterwards carries the seal, and the
-     * push sends its job to the ready queue instead.
+     * at: the sweep had counted before it existed.
+     *
+     * Two things now catch this, and this test passes on either: the seal, when
+     * the sweep is still inside the second (its own test is below), and the
+     * push's own look at the watermark after storing, when the sweep has
+     * finished and deleted the counter - which is what happens here.
      */
     public function test_a_delayed_push_that_draws_its_id_after_the_sweep_finished_that_second_is_not_lost(): void
     {
@@ -223,7 +224,7 @@ class JobLossRacesTest extends TestCase
         $queue = $this->worker('operator');
         $queue->pushRaw(self::job('before'));
 
-        $this->client->before('getset|delMany', 'q:default:job:', function () {
+        $this->client->before('putMany|getset|delMany', 'q:default:job:', function () {
             $worker = $this->worker('busy');
             $worker->pushRaw(self::job('during-1'));
             $worker->pushRaw(self::job('during-2'));
@@ -723,6 +724,144 @@ class JobLossRacesTest extends TestCase
         Carbon::setTestNow(Carbon::createFromTimestamp($due + 1));
 
         $this->assertSame(['foreign'], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * A push whose own move loses the lease must not leave the job in the
+     * bucket. Nothing returns to a second the watermark has passed, and the
+     * lease it lost may be a dead worker's, held for the rest of retry_after -
+     * so the job went to the ready queue and was never seen again.
+     */
+    public function test_a_push_that_loses_its_own_move_still_delivers_the_job(): void
+    {
+        $this->worker('warm-up')->pop();
+        $due = Carbon::now()->getTimestamp() + 1;
+
+        // A worker died part-way through moving something in this second, so its
+        // move lease is held by nobody who will ever finish.
+        $this->store->put('q:default:mig:'.$due.':1', 'a-worker-that-died', 600);
+
+        // Between the push reading the watermark and drawing its bucket id, the
+        // sweep passes that second - finding it empty, so it seals nothing this
+        // push will see, leaves no tombstone, and deletes the counter.
+        $this->client->before('increment', 'q:default:d:'.$due.':tail', function () use ($due) {
+            Carbon::setTestNow(Carbon::createFromTimestamp($due));
+            $this->worker('sweeper')->pop();
+        });
+
+        // The push stores its job into a second nothing will sweep again, and
+        // its own move loses the dead worker's lease.
+        $this->worker('producer')->laterRaw(1, self::job('self-moved'));
+
+        $this->assertSame(['self-moved'], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * The order pop()'s set_nx exists for: the payload lands AFTER the worker
+     * read the slot as empty and BEFORE it writes its tombstone. A plain write
+     * there destroys a job the queue had accepted.
+     */
+    public function test_a_payload_that_lands_before_the_slot_is_killed_is_not_overwritten(): void
+    {
+        $producer = $this->worker('producer');
+        $producer->pushRaw(self::job('first'));
+
+        // The reader has seen slot 2 empty; the push lands before it can kill it.
+        $this->store->increment('q:default:tail');
+
+        $this->client->before('setNx', 'q:default:job:2', function () {
+            $this->store->setNx('q:default:job:2', self::job('landed-just-in-time'));
+        });
+
+        $delivered = $this->drain($this->worker('healthy'));
+        sort($delivered);
+
+        $this->assertSame(['first', 'landed-just-in-time'], $delivered);
+    }
+
+    /**
+     * due == swept: the sweep has just finished that second and deleted its
+     * counter, so nothing is sealed and no sweep will return. The push's own
+     * check has to treat "the watermark reached my second" as passed.
+     */
+    public function test_a_delayed_push_into_the_second_the_sweep_just_finished_is_moved(): void
+    {
+        $this->worker('warm-up')->pop();
+        $due = Carbon::now()->getTimestamp() + 1;
+
+        // The watermark lands exactly ON this second while the push is between
+        // reading it and drawing its id: the counter is deleted, so the id the
+        // push draws carries no seal, and its slot is never tombstoned.
+        $this->client->before('increment', 'q:default:d:'.$due.':tail', function () use ($due) {
+            Carbon::setTestNow(Carbon::createFromTimestamp($due));
+            $this->worker('sweeper')->pop();
+        });
+
+        $this->worker('producer')->laterRaw(1, self::job('on-the-boundary'));
+
+        $this->assertSame(['on-the-boundary'], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * clear() used to start at the reader, so a job whose worker had died - it
+     * sits BELOW the reader with its payload still there - was neither cleared
+     * nor counted, and redelivery handed it back after the queue had reported
+     * itself empty.
+     */
+    public function test_clearing_takes_the_jobs_of_workers_that_died(): void
+    {
+        $queue = $this->worker('operator');
+        $queue->pushRaw(self::job('worker-died-holding-it'));
+
+        $this->worker('dies')->pop();
+        $this->everyWorkerIsGone();
+
+        $this->assertSame(1, $queue->clear(), 'the abandoned job was not counted as cleared');
+        $this->assertSame(0, $queue->size());
+        $this->assertSame([], $this->drain($this->worker('healthy')), 'a cleared job came back');
+    }
+
+    /**
+     * The gauge of a generation nobody can reach any more goes with the clear
+     * that abandoned it, rather than sitting there for ever.
+     */
+    public function test_clearing_takes_the_gauge_of_the_generation_it_abandons(): void
+    {
+        $queue = $this->worker('operator');
+        $queue->laterRaw(60, self::job('delayed'));
+
+        $this->assertArrayHasKey('q:default:delayed:0', $this->store->all());
+
+        $queue->clear();
+
+        $this->assertArrayNotHasKey('q:default:delayed:0', $this->store->all());
+        $this->assertSame(0, $queue->delayedSize());
+    }
+
+    /**
+     * A pop walking a long run of killed slots gives up for now rather than
+     * raising: the slots were killed by workers, nothing was lost, and the next
+     * poll carries on from where the cursor reached.
+     */
+    public function test_a_long_run_of_killed_slots_ends_the_poll_without_an_error(): void
+    {
+        $queue = $this->worker('walker');
+
+        // More killed slots than one pop will step over, then a real job.
+        for ($id = 1; $id <= 1100; $id++) {
+            $this->store->increment('q:default:tail');
+            $this->store->put('q:default:job:'.$id, RostamQueue::TOMBSTONE);
+        }
+
+        $queue->pushRaw(self::job('behind-them-all'));
+
+        $this->assertNull($queue->pop(), 'a run of killed slots should end the poll, not raise');
+        $this->assertSame(0, $queue->holesSeen(), 'slots killed by somebody else are not this pop\'s holes');
+
+        $job = $queue->pop();
+
+        $this->assertNotNull($job);
+        $this->assertSame('behind-them-all', json_decode($job->getRawBody(), true)['id']);
     }
 
     /**

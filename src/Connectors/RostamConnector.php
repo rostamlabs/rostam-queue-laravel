@@ -57,22 +57,61 @@ class RostamConnector implements ConnectorInterface
     public function connect(array $config): QueueContract
     {
         $this->declaration($config);
+
+        $retryAfter = (int) ($config['retry_after'] ?? 90);
+        $tombstoneTtl = (int) ($config['tombstone_ttl'] ?? 604800);
+
+        // A killed slot has to outlive the lease of the worker that might still
+        // be writing into it, or a slot killed while a lease was held comes back
+        // to life under a lease nobody will release. Both are free settings; the
+        // relationship between them is not.
+        if ($tombstoneTtl <= $retryAfter) {
+            throw UnsafeQueueStore::tombstonesOutliveLeases($tombstoneTtl, $retryAfter);
+        }
+
         $client = TcpClient::fromArray($this->connection($config));
 
         return new RostamQueue(
             $client,
             prefix: (string) ($config['prefix'] ?? 'queues:'),
             default: (string) ($config['queue'] ?? 'default'),
-            retryAfter: (int) ($config['retry_after'] ?? 90),
+            retryAfter: $retryAfter,
             sweepSeconds: (int) ($config['sweep_seconds'] ?? 60),
             reclaimBatch: (int) ($config['reclaim_batch'] ?? 32),
-            tombstoneTtl: (int) ($config['tombstone_ttl'] ?? 604800),
-            watch: new EvictionWatch(
-                $client,
-                required: true,
-                everySeconds: (int) ($config['verify_every'] ?? 60),
-            ),
+            tombstoneTtl: $tombstoneTtl,
+            watch: $this->watch($config, $client),
             dispatchAfterCommit: isset($config['after_commit']) ? (bool) $config['after_commit'] : null,
+        );
+    }
+
+    /**
+     * The eviction check, unless the operator has taken it off.
+     *
+     * The count is node-wide and cumulative since the server started, so on a
+     * node shared with anything else it is somebody else's evictions too, and a
+     * queue refused by it stays refused until the SERVER restarts - which, on a
+     * node without -data, is the backlog gone. That is the right default and a
+     * bad surprise, so it is a setting: `on_evictions => 'ignore'` runs without
+     * the check, and accepts what the check was there to catch.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    protected function watch(array $config, TcpClient $client): ?EvictionWatch
+    {
+        $on = $config['on_evictions'] ?? 'refuse';
+
+        if ($on === 'ignore') {
+            return null;
+        }
+
+        if ($on !== 'refuse') {
+            throw UnsafeQueueStore::unknownEvictionPolicy(is_string($on) ? $on : get_debug_type($on));
+        }
+
+        return new EvictionWatch(
+            $client,
+            required: true,
+            everySeconds: (int) ($config['verify_every'] ?? 60),
         );
     }
 

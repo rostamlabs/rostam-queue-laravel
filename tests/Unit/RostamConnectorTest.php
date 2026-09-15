@@ -170,6 +170,46 @@ class RostamConnectorTest extends TestCase
         $this->assertNull(self::read($this->connect([]), 'dispatchAfterCommit'));
     }
 
+    /**
+     * A killed slot has to outlive the lease of a worker that may still be
+     * writing into it. Both are free settings, and the relationship between
+     * them is the one thing holding several of the driver's races closed.
+     */
+    public function test_a_tombstone_that_does_not_outlive_a_lease_is_refused(): void
+    {
+        foreach ([[90, 90], [90, 30], [3600, 600]] as [$retryAfter, $tombstoneTtl]) {
+            try {
+                $this->connect(['retry_after' => $retryAfter, 'tombstone_ttl' => $tombstoneTtl]);
+                $this->fail("tombstone_ttl {$tombstoneTtl} was accepted against retry_after {$retryAfter}");
+            } catch (UnsafeQueueStore $e) {
+                $this->assertStringContainsString('must be longer than retry_after', $e->getMessage());
+            }
+        }
+
+        $this->connect(['retry_after' => 600, 'tombstone_ttl' => 601]);
+    }
+
+    /**
+     * The eviction count is node-wide, and a queue refused by it stays refused
+     * until the SERVER restarts. On a node shared with something else that is
+     * somebody else's evictions, so there is a way to say so - and it says what
+     * it costs.
+     */
+    public function test_the_eviction_check_can_be_turned_off_deliberately(): void
+    {
+        $watching = (new \ReflectionProperty(RostamQueue::class, 'watch'));
+
+        $this->assertNotNull($watching->getValue($this->connect([])), 'the check is on by default');
+        $this->assertNull($watching->getValue($this->connect(['on_evictions' => 'ignore'])));
+
+        try {
+            $this->connect(['on_evictions' => 'warn']);
+            $this->fail('an unknown on_evictions value was accepted');
+        } catch (UnsafeQueueStore $e) {
+            $this->assertStringContainsString('must be "refuse" or "ignore"', $e->getMessage());
+        }
+    }
+
     public function test_it_says_which_connection_is_missing(): void
     {
         $this->expectException(UnsafeQueueStore::class);

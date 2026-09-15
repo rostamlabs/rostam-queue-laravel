@@ -9,6 +9,7 @@ namespace Rostam\Queue\Tests\Chaos;
 use Illuminate\Container\Container;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Rostam\Exceptions\ServerException;
 use Rostam\Kv\TcpClient;
 use Rostam\Queue\RostamQueue;
 
@@ -123,6 +124,8 @@ class ChaosTest extends TestCase
         mt_srand($seed);
         fwrite(STDERR, "\n[chaos] seed {$seed} (replay with CHAOS_SEED={$seed})\n");
 
+        $evictedBefore = $this->evictionsLive($target);
+
         $producers = [];
         for ($p = 1; $p <= self::PRODUCERS; $p++) {
             $producers[] = $this->spawn(['produce', $target, $prefix, $this->dir, 'p'.$p, (string) self::JOBS_PER_PRODUCER]);
@@ -186,7 +189,7 @@ class ChaosTest extends TestCase
         for ($round = 0; $round < 5; $round++) {
             while ($job = $final->pop()) {
                 $id = json_decode($job->getRawBody(), true)['id'];
-                $final->getClient()->put($prefix.'handled:'.$id, '1');
+                $final->getClient()->put($prefix.'handled:'.$id, '1', 3600);
                 $job->delete();
                 $drained[] = $id;
             }
@@ -196,6 +199,7 @@ class ChaosTest extends TestCase
         $produced = array_unique($this->logged('produced'));
         $taken = array_merge($this->logged('taken'), $drained);
         $missing = $this->neverHandled($target, $prefix, $produced);
+        $evicted = $this->evictionsLive($target) - $evictedBefore;
 
         fwrite(STDERR, sprintf(
             "[chaos] produced %d, handed out %d (%d more than once), workers killed %d, drained at the end %d, never handled %d\n",
@@ -207,6 +211,18 @@ class ChaosTest extends TestCase
         $childErrors = trim((string) @file_get_contents($this->dir.'/stderr.log'));
         $context = $childErrors === '' ? '' : "\nchild stderr:\n".substr($childErrors, -2000);
 
+        // A server that threw records away during the run has already broken the
+        // premise: this test asks whether the QUEUE loses jobs, and the driver
+        // refuses to run on such a node in the first place (the chaos workers
+        // deliberately have no such guard). Saying so beats reporting the
+        // server's loss as the queue's.
+        if ($evicted > 0) {
+            $this->markTestSkipped(
+                "the server evicted {$evicted} live record(s) while this test ran, so nothing here is about the "
+                .'queue. Give it more memory, start it with -relocating-eviction, or point the test at an emptier node.'
+            );
+        }
+
         if ($missing !== []) {
             $context .= "\n".$this->whereTheJobsAre($target, $prefix, $missing);
         }
@@ -214,6 +230,21 @@ class ChaosTest extends TestCase
         $this->assertSame(self::PRODUCERS * self::JOBS_PER_PRODUCER, count($produced), 'a producer did not finish'.$context);
         $this->assertSame([], $missing, 'accepted jobs were never handled'.$context);
         $this->assertNull($final->pop(), 'jobs were still waiting after the final drain'.$context);
+    }
+
+    /**
+     * Live records the node says it has thrown away, or 0 from a server too old
+     * to count them - where a run simply cannot tell the two apart.
+     */
+    private function evictionsLive(string $target): int
+    {
+        [$host, $port] = explode(':', $target);
+
+        try {
+            return TcpClient::fromArray(['host' => $host, 'port' => (int) $port])->kvMetrics()->evictionsLive() ?? 0;
+        } catch (ServerException) {
+            return 0;
+        }
     }
 
     /**

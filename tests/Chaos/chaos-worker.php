@@ -106,7 +106,10 @@ while (! file_exists($stopFile)) {
     // finish, and the parent cannot tell that from a job the queue dropped.
     // Here a kill between the mark and the delete leaves the job to be
     // redelivered and handled again, which is what at-least-once allows.
-    $queue->getClient()->put($prefix.'handled:'.$id, '1');
+    // With a TTL: on a server shared with anything else these marks are the
+    // test's litter, and this driver refuses a node that has ever evicted a live
+    // record - so it must not be the thing filling one up.
+    $queue->getClient()->put($prefix.'handled:'.$id, '1', 3600);
 
     $job->delete();
 }

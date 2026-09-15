@@ -155,6 +155,15 @@ class EvictionCheckOverTheWireTest extends TestCase
         }
 
         $client = $this->client();
+        $evicted = $client->kvMetrics()->evictionsLive();
+
+        // A server somebody has already filled up cannot show what a clean one
+        // does. Refusing it is the behaviour two tests above; here it would only
+        // look like a failure of the thing being demonstrated.
+        if ($evicted > 0) {
+            $this->markTestSkipped("this server has already evicted {$evicted} live record(s), so it is not a clean node");
+        }
+
         $queue = $this->queue($client, new EvictionWatch($client, required: true));
 
         $queue->pushRaw(json_encode(['id' => 'kept']));

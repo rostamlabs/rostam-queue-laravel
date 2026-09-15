@@ -84,6 +84,13 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      */
     private const MAX_STEPS = 1024;
 
+    /**
+     * How many slots one clear reads and kills per round trip. A queue cleared
+     * with a million ids outstanding is two round trips per this many, not two
+     * per id.
+     */
+    private const CLEAR_BATCH = 512;
+
     /** @var array<string, int> */
     protected array $holes = [];
 
@@ -254,6 +261,10 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      * the job is stored, the push looks at the sweep once more: if it has passed
      * this second in the meantime, the push moves the job itself.
      *
+     * The id it returns is the delayed bucket's, not the ready queue's - a
+     * different id space from pushRaw()'s, and meaningful only inside the
+     * second the job is due. Laravel ignores it.
+     *
      * @param  \DateTimeInterface|\DateInterval|int  $delay
      */
     public function laterRaw($delay, string $payload, $queue = null): string
@@ -286,10 +297,20 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         // The sweep may have passed this second while the job was on its way -
         // counted the bucket before this id existed, and finished, or finished
         // so long ago that its seal is gone. Either way no sweep will come back
-        // for it, so this push moves it. If a sweep is moving it right now, the
-        // move lease makes one of them do it.
-        if ($due <= $this->swept($queue)) {
-            $this->moveDelayed($queue, $due, $id);
+        // for it, so this push moves it itself.
+        //
+        // Losing the move lease here is not somebody else finishing the job:
+        // the lease may be a dead worker's, held for the rest of retry_after,
+        // and no sweep will return to this second. So the job goes to the ready
+        // queue and the bucket copy is dropped. If the lease holder is alive and
+        // moves it too, that is a duplicate - which at-least-once allows, and
+        // losing the job is not.
+        if ($due <= $this->swept($queue) && ! $this->moveDelayed($queue, $due, $id)) {
+            $placed = $this->enqueue($queue, $payload);
+            $this->client->del($this->bucketJobKey($queue, $due, $id));
+            $this->client->increment($this->gaugeKey($queue, $generation), -1, $this->tombstoneTtl);
+
+            return (string) $placed;
         }
 
         return (string) $id;
@@ -398,10 +419,13 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      *
      * The walk needs no scan because the ids are dense: every slot below the
      * reader was either claimed or killed, so an empty one there is a finished
-     * job. Each pop reads a window of them in two round trips - payloads, then
-     * leases - and looks past a job still in flight, so one long-running job
-     * does not hold back the redelivery of every abandoned one above it. The
-     * cursor itself only moves across slots that are settled.
+     * job. Each pop reads a window of `reclaimBatch` ids in two round trips -
+     * payloads, then leases - and looks past a job still in flight, so one
+     * long-running job does not hold back the abandoned ones above it WITHIN
+     * that window. The cursor itself only moves across slots that are settled,
+     * so a job still running does hold the window in place: anything above
+     * `reclaim + reclaimBatch` waits for it to finish. Nothing is lost by
+     * waiting - the payload and its lapsed lease stay exactly as they are.
      *
      * Putting a job back is claimed first, with the job's own lease, so two
      * workers passing the same abandoned job do not both requeue it. The copy
@@ -510,11 +534,14 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     /**
      * Delete every job on a queue, waiting and delayed. Returns how many went.
      *
-     * Waiting jobs are overwritten with tombstones rather than deleted, slot by
-     * slot up to the writer: a push that has drawn one of those ids and not yet
-     * written finds its slot killed and draws a fresh one past the clear, where
-     * it is delivered. Deleting instead left such a push free to land behind
-     * the reader, delivered by nobody and cleared by nobody.
+     * Waiting jobs are overwritten with tombstones rather than deleted, from the
+     * redelivery cursor up to the writer: a push that has drawn one of those ids
+     * and not yet written finds its slot killed and draws a fresh one past the
+     * clear, where it is delivered. Deleting instead left such a push free to
+     * land behind the reader, delivered by nobody and cleared by nobody.
+     *
+     * Unlike pop()'s `set_nx`, this overwrites - it is the one place the driver
+     * destroys a payload, which is what clearing a queue is.
      *
      * Delayed jobs cannot be found - their buckets cannot be enumerated - so
      * they are orphaned instead: the delayed generation moves on, and a job
@@ -522,7 +549,9 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      * reaches its second. A job enqueued while the clear is running may land on
      * either side of it.
      *
-     * A job a worker is running when the queue is cleared finishes normally.
+     * A job a worker is running when the queue is cleared finishes normally: it
+     * holds the payload already, and the tombstone only stops the slot being
+     * handed out again. A job whose worker died is cleared like any other.
      *
      * @param  \UnitEnum|string|null  $queue
      */
@@ -530,22 +559,42 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     {
         $queue = $this->queueName($queue);
         $at = $this->tail($queue)->value();
+        $reclaim = new Cursor($this->client, $this->key($queue, 'reclaim'));
         $removed = 0;
 
-        for ($id = $this->head($queue)->value() + 1; $id <= $at; $id++) {
-            $previous = $this->client->getset($this->jobKey($queue, $id), self::TOMBSTONE, $this->tombstoneTtl);
+        // From the REDELIVERY cursor, not the reader: a job whose worker died is
+        // below the reader with its payload still there, waiting to be handed
+        // back. Clearing from the reader left those to reappear minutes later on
+        // a queue that had just reported itself empty.
+        for ($id = $reclaim->value() + 1; $id <= $at; $id += self::CLEAR_BATCH) {
+            $keys = [];
 
-            if ($previous !== null && $previous !== self::TOMBSTONE) {
-                $removed++;
+            for ($slot = $id; $slot <= min($id + self::CLEAR_BATCH - 1, $at); $slot++) {
+                $keys[] = $this->jobKey($queue, $slot);
             }
+
+            // Read, then kill: what was read is what is being reported as
+            // cleared, and the tombstone is what stops a push that has drawn one
+            // of these ids from landing behind the cursors.
+            foreach ($this->client->getMany($keys) as $payload) {
+                if ($payload !== null && $payload !== self::TOMBSTONE) {
+                    $removed++;
+                }
+            }
+
+            $this->client->putMany(array_map(
+                fn (string $key) => [$key, self::TOMBSTONE, $this->tombstoneTtl],
+                $keys,
+            ));
         }
 
         $generation = $this->delayedGeneration($queue);
         $delayed = $this->delayedSize($queue);
 
-        // Move the reader up to the writer, and never back: a concurrent worker
-        // may already be further along.
+        // Move the reader and the redelivery cursor up to the writer, and never
+        // back: a concurrent worker may already be further along.
         $this->head($queue)->advanceTo($at);
+        $reclaim->advanceTo($at);
 
         $this->client->increment($this->key($queue, 'dgen'));
         $this->client->del($this->gaugeKey($queue, $generation));
@@ -644,9 +693,12 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         if ($stored !== null && $stored !== self::TOMBSTONE) {
             [$writtenUnder, $payload] = self::unwrapDelayed($stored);
 
-            // The generation is read now, under the lease, not once per sweep. A
-            // sweep that read it before a clear would otherwise take a job
-            // delayed after the clear for one written before it, and delete it.
+            // Two guards, either of which is enough today, kept because they
+            // fail differently: the generation is read HERE, under the lease
+            // rather than once per sweep, and only a generation BELOW the
+            // current one is deleted. A sweep that read the generation before a
+            // clear and compared it for inequality would take a job delayed
+            // after that clear for one written before it, and delete it.
             if ($writtenUnder !== null && $writtenUnder < $this->delayedGeneration($queue)) {
                 $this->client->del($key);            // cleared before it came due
             } else {
