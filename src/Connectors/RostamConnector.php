@@ -27,7 +27,11 @@ use Rostam\Queue\RostamQueue;
  *   sits still while newer writes churn past it is evicted when the ring wraps.
  *   A queue churns by nature. On v0.7.0-beta7 with 32 MiB, put/delete churn of
  *   ten times the budget evicted two small keys that were never touched again,
- *   with nothing else live. `-relocating-eviction` rescued them.
+ *   with nothing else live. `-relocating-eviction` kept them - best-effort, as
+ *   the server describes it: it never allocates a page, never triggers another
+ *   eviction and never fails a write, so a record that does not fit the room a
+ *   freed page leaves is dropped anyway. Hence the second half of the
+ *   declaration, and the eviction count as a backstop.
  *
  * So the connection declares the one setup that holds, which cannot be read off
  * the wire:

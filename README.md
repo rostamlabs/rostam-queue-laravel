@@ -36,10 +36,18 @@ A single-node `rostam-server` throws them away in two ways, both measured:
   touched again, with nothing else on the server. A queue is churn, and a delayed
   job, or a backlog nobody is working, is exactly a record that sits still.
 
-Started with **`-relocating-eviction`**, the server rescues live records from the
-pages it evicts. The same churn left both keys in place, and a first-in-first-out
-backlog churned eight times over held with **no live evictions at a quarter of the
-budget** — while at half it evicted 1,714 live records along the way. So:
+Started with **`-relocating-eviction`**, the server copies a page's still-live
+records forward instead of dropping them with it. The same churn left both keys in
+place, and a first-in-first-out backlog churned eight times over held with **no
+live evictions at a quarter of the budget** — while at half it evicted 1,714 live
+records along the way.
+
+It is best-effort by design, and the server says so: it never allocates a page,
+never triggers another eviction and never fails a write, so a record that does not
+fit the room left over is dropped like any other. That is why the flag is one of
+three things this driver asks for, not the whole answer — the live set has to stay
+well under the budget, and the eviction count is the backstop. The flag does
+nothing under `-cluster`, which this driver does not support anyway. So:
 
 ```php
 'at_cap_policy' => 'headroom',

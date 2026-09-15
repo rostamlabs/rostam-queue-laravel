@@ -33,8 +33,9 @@ class UnsafeQueueStore extends RuntimeException
             ."\n\n"
             .'"headroom" declares the setup that keeps them:'
             ."\n\n"
-            .'  - a single rostam-server started with -relocating-eviction, which rescues live records '
-            .'from the pages it evicts;'
+            .'  - a single rostam-server started with -relocating-eviction, which copies a page\'s '
+            .'still-live records forward instead of dropping them with it - best-effort, since it never '
+            .'allocates a page or fails a write, so a record that does not fit the room left over goes;'
             ."\n"
             .'  - its max_memory well above everything live on it - the backlog, delayed jobs, and '
             .'anything else sharing the server. Measured, a live set of a quarter of the budget held; '
