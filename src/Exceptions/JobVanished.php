@@ -9,31 +9,43 @@ namespace Rostam\Queue\Exceptions;
 use RuntimeException;
 
 /**
- * Raised when a pop steps over more empty slots than any healthy queue has.
+ * Raised when the queue meets far more empty slots than a healthy one produces.
  *
- * A slot below the tail that holds nothing has two causes. One is benign: a
- * worker claimed the job and died before it could move the cursor, so the next
- * pop steps over the space it left. The other is not: the engine evicted the
- * job, which on `PolicyRingbufEvict` is what happens to anything that has been
- * sitting long enough to become the oldest entry.
+ * An empty slot between the reader and the writer has two causes. One is
+ * harmless: a push that has drawn its id and not yet written its payload. The
+ * worker kills the slot, the push finds it taken and draws another id, and
+ * nothing is lost. The other is not: a record that was written and then
+ * vanished - evicted because the node reached capacity, or wiped by a flush -
+ * which is a job the caller was promised and will not get.
  *
- * Nothing on the wire tells the two apart, and one worker dying leaves one
- * hole. A run of them does not; that is eviction, and it means jobs the caller
- * was promised are gone. Failing loudly is the only useful thing left to do -
- * a queue that quietly skips missing work looks healthy while it loses.
+ * Nothing on the wire tells the two apart for one slot. But a push is caught
+ * mid-write rarely and briefly; a run of empty slots in a single pop is the
+ * store dropping jobs, and the only useful thing left is to say so loudly.
  */
 class JobVanished extends RuntimeException
 {
     public static function tooManyHoles(string $queue, int $holes): self
     {
         return new self(sprintf(
-            'queue [%s]: stepped over %d empty slots in a single pop. One is a worker that '
-            .'died mid-claim; this many is the store dropping jobs. Rostam evicts by write '
-            .'order under its default PolicyRingbufEvict, and a queued job - written once, '
-            .'read once - is exactly what it reaches first. Run the server with '
-            .'PolicyRejectWrites and enough memory for the backlog.',
+            'queue [%s]: met %d empty slots in a single pop. A push caught mid-write leaves one and '
+            .'re-routes itself; a run like this means jobs were written and then vanished - evicted '
+            .'because the node reached capacity, or wiped by a flush. On rostam v0.7.0-beta3 and newer, '
+            .'check rostam_kv_evictions_live_total on the node: anything above zero is live records '
+            .'thrown away. A single-node rostam-server always evicts at capacity; keep its max_memory '
+            .'well above the backlog, or run a -cluster, which refuses writes instead.',
             $queue,
             $holes,
+        ));
+    }
+
+    public static function cannotPlace(string $queue): self
+    {
+        return new self(sprintf(
+            'queue [%s]: drew 64 ids in a row whose slots had already been killed. A push loses its '
+            .'slot only when a worker reaches it between the push drawing the id and writing the '
+            .'payload; sixty-four in a row means pushes are stalling far longer than a round trip, '
+            .'or something other than a worker is writing into this queue\'s keys.',
+            $queue,
         ));
     }
 }

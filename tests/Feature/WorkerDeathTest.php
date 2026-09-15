@@ -99,15 +99,24 @@ class WorkerDeathTest extends TestCase
             self::LEASE_SECONDS,
         ));
 
-        $process = proc_open([PHP_BINARY, $file], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        // stderr goes to a file, not a pipe: a pipe nobody reads blocks the
+        // child once it fills, and what the child said on the way down - a
+        // fatal, a refused connection - is the only explanation a failure here
+        // would have.
+        $errors = (string) tempnam(sys_get_temp_dir(), 'rq-err');
+        $process = proc_open([PHP_BINARY, $file], [1 => ['pipe', 'w'], 2 => ['file', $errors, 'w']], $pipes);
         $claimed = stream_get_contents($pipes[1]);
-        foreach ($pipes as $pipe) {
-            fclose($pipe);
-        }
+        fclose($pipes[1]);
         $status = proc_close($process);
+        $stderr = trim((string) file_get_contents($errors));
         @unlink($file);
+        @unlink($errors);
 
-        $this->assertSame(1, $status, 'the child was supposed to die holding the job');
+        $this->assertSame(
+            1,
+            $status,
+            'the child was supposed to die holding the job'.($stderr === '' ? '' : "\nchild stderr:\n".$stderr),
+        );
 
         return $claimed;
     }

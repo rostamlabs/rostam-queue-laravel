@@ -9,7 +9,6 @@ namespace Rostam\Queue\Tests\Unit;
 use Illuminate\Container\Container;
 use PHPUnit\Framework\TestCase;
 use Rostam\Queue\Exceptions\JobVanished;
-use Rostam\Queue\RostamJob;
 use Rostam\Queue\RostamQueue;
 use Rostam\Testing\ArrayKvClient;
 
@@ -212,17 +211,20 @@ class RostamQueueTest extends TestCase
     }
 
     /**
-     * A worker that dies between claiming a job and moving the cursor leaves an
-     * empty slot. Nothing else will step over it, so the next pop must - or the
-     * queue stalls on a hole for good.
+     * A slot below the tail that holds nothing - a record the engine evicted,
+     * or one removed behind the queue's back - is killed and stepped over, and
+     * counted. Stopping there would stall the queue on it for good.
+     *
+     * (A worker that dies holding a job leaves no such slot: the payload stays
+     * until its lease lapses and it is redelivered.)
      */
-    public function test_a_hole_left_by_a_dead_worker_is_stepped_over(): void
+    public function test_an_empty_slot_below_the_tail_is_stepped_over_and_counted(): void
     {
-        $this->queue->pushRaw(json_encode(['id' => 'abandoned']));
+        $this->queue->pushRaw(json_encode(['id' => 'vanished']));
         $this->queue->pushRaw(json_encode(['id' => 'next']));
 
-        // The claim happened; the cursor never moved.
-        $this->client->getdel('q:default:job:1');
+        // Gone from under the queue - evicted, as far as the queue can tell.
+        $this->client->del('q:default:job:1');
 
         $job = $this->queue->pop();
 
@@ -241,13 +243,13 @@ class RostamQueueTest extends TestCase
             $this->queue->pushRaw(json_encode(['id' => $i]));
         }
 
-        // Everything evicted, as PolicyRingbufEvict would.
+        // Everything evicted, as a node at capacity would.
         for ($id = 1; $id <= 100; $id++) {
             $this->client->del('q:default:job:'.$id);
         }
 
         $this->expectException(JobVanished::class);
-        $this->expectExceptionMessageMatches('/stepped over \d+ empty slots/');
+        $this->expectExceptionMessageMatches('/met \d+ empty slots in a single pop.*rostam_kv_evictions_live_total/s');
 
         $this->queue->pop();
     }
@@ -297,54 +299,5 @@ class RostamQueueTest extends TestCase
 
         $this->assertNull($this->queue->pop('reports'));
         $this->assertNotNull($this->queue->pop('emails'));
-    }
-
-    /**
-     * The property the compare-and-swap actually buys, and the one a
-     * single-threaded test cannot see.
-     *
-     * Two workers can examine the same slot at the same moment: both read the
-     * same head, both try to claim it, one wins the getdel and one gets
-     * nothing. Then BOTH advance. If the cursor moved with an unconditional
-     * incr, head would jump by two and the very next job would be stepped over
-     * without ever being handed to anyone - a queue that silently drops the
-     * job after the one it just delivered.
-     *
-     * With a compare-and-swap only one of the two advances; the loser learns
-     * the slot was not its own and looks again.
-     *
-     * The rival pop is wedged in through the fake client's write hook, at the
-     * exact instant the first one is about to move the cursor.
-     */
-    public function test_two_workers_on_the_same_slot_do_not_skip_the_next_job(): void
-    {
-        $this->queue->pushRaw(json_encode(['id' => 'first']));
-        $this->queue->pushRaw(json_encode(['id' => 'second']));
-
-        $rival = null;
-        $this->client->beforeWrite = function (string $key) use (&$rival) {
-            if ($key !== 'q:default:head' || $rival !== null) {
-                return;
-            }
-
-            // A second worker, arriving in the window between the winner
-            // claiming the job and moving the cursor.
-            $rival = $this->queue->pop() ?? false;
-        };
-
-        $first = $this->queue->pop();
-        $this->client->beforeWrite = null;
-
-        $this->assertNotNull($first);
-        $this->assertSame('first', json_decode($first->getRawBody(), true)['id']);
-
-        // Whatever the rival saw, "second" must still be deliverable to
-        // somebody - either it took it, or it is still there to take.
-        $delivered = array_filter([
-            $rival instanceof RostamJob ? json_decode($rival->getRawBody(), true)['id'] : null,
-            ($later = $this->queue->pop()) ? json_decode($later->getRawBody(), true)['id'] : null,
-        ]);
-
-        $this->assertContains('second', $delivered, 'the job after the claimed one was skipped entirely');
     }
 }

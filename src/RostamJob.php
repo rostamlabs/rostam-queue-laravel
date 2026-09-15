@@ -76,29 +76,32 @@ class RostamJob extends Job implements JobContract
     /**
      * Put the job back for another attempt.
      *
-     * The old copy is removed and a fresh one pushed with the attempt count
-     * carried forward, rather than the lease simply being dropped. Dropping it
-     * would work - redelivery would find the job unheld and requeue it - but
-     * only after the lease expired, which would turn an immediate retry into a
-     * retry_after-long wait nobody asked for.
+     * A fresh copy is pushed with the attempt count carried forward, rather
+     * than the lease simply being dropped. Dropping it would work - redelivery
+     * would find the job unheld and requeue it - but only after the lease
+     * expired, which would turn an immediate retry into a retry_after-long wait
+     * nobody asked for.
+     *
+     * The new copy is written BEFORE the old one is finished. The other order
+     * deleted the job first, so a retry that failed to land - a dead connection,
+     * a killed worker - left neither copy. This way a failure part-way leaves
+     * the old job under a lease that lapses, and it comes back.
      */
     public function release($delay = 0): void
     {
         parent::release($delay);
 
-        $payload = json_encode(array_merge($this->decoded, [
+        $payload = (string) json_encode(array_merge($this->decoded, [
             'attempts' => $this->attempts(),
         ]), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-        $this->rostam->complete($this->queue, $this->id, $this->reservation);
-
         if ($delay > 0) {
             $this->rostam->laterRaw($delay, $payload, $this->queue);
-
-            return;
+        } else {
+            $this->rostam->pushRaw($payload, $this->queue);
         }
 
-        $this->rostam->pushRaw($payload, $this->queue);
+        $this->rostam->complete($this->queue, $this->id, $this->reservation);
     }
 
     /**
