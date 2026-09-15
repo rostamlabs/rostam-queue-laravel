@@ -6,11 +6,14 @@ declare(strict_types=1);
 
 namespace Rostam\Queue;
 
+use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
 use Illuminate\Support\Carbon;
 use Rostam\Contracts\KvClient;
 use Rostam\Queue\Exceptions\JobVanished;
+
+use function Illuminate\Support\enum_value;
 
 /**
  * A Laravel queue on Rostam's key-value engine.
@@ -34,40 +37,52 @@ use Rostam\Queue\Exceptions\JobVanished;
  *   in between used to step over it, and the payload landed where nothing would
  *   read. Now the worker kills the slot with `set_nx` - a TOMBSTONE - and the
  *   push writes with `set_nx` too, so exactly one of them owns the slot. If the
- *   worker won, the push simply draws another id.
+ *   worker won, the push simply draws another id. clear() kills the slots it
+ *   passes the same way, so a push straddling a clear cannot land behind it.
  * - A delayed job used to be read destructively on its way to the ready queue,
  *   so a worker dying in between took the only copy. Now it is copied first
  *   and deleted after, under a per-item lease, and a duplicate is the worst a
  *   crash can cause.
- * - A delayed push could land in a second the sweep had already passed, or in
- *   one it had passed long before (a job due in the past). Now the sweep SEALS
- *   each second's id counter as it passes it; a push that draws a sealed id, or
- *   finds its slot tombstoned, goes straight to the ready queue instead.
+ * - A delayed push could land in a second the sweep was passing, or had
+ *   passed. The sweep SEALS a second's id counter before it counts it, so a
+ *   push that draws an id meanwhile knows it was too late; and a push that
+ *   stored its job checks afterwards whether the sweep has passed its second,
+ *   and moves the job itself if so.
  *
- * EVICTION. A queue is only as durable as the node never throwing records away,
- * and a single-node `rostam-server` evicts at capacity without an error. The
- * connector makes the operator say which of the two safe setups this is, and
- * {@see EvictionWatch} refuses a node that has already evicted live records.
- * What this class can see on its own is the damage - a record that vanished
- * after it was written - and {@see JobVanished} reports a run of it.
+ * EVICTION. A queue is only as durable as the node never throwing records away.
+ * {@see EvictionWatch} refuses a node that has evicted live records; what this
+ * class can see on its own is the damage - a record that vanished after it was
+ * written - and {@see JobVanished} reports a run of it.
  */
-class RostamQueue extends Queue implements QueueContract
+class RostamQueue extends Queue implements ClearableQueue, QueueContract
 {
     /**
      * What a killed slot holds. No Laravel payload - a JSON object - can equal
-     * it. Written without control bytes on purpose: a formatter folds a
-     * double-quoted escape into raw bytes and turns the source file binary.
+     * it.
      */
     public const TOMBSTONE = 'rostam-queue:tombstone:v1';
 
     /**
-     * Set on a delayed second's id counter once that second has been swept.
+     * Set on a delayed second's id counter once the sweep has counted it.
      * Increments keep it, so every id drawn afterwards carries it too.
      */
     public const SEALED = 1 << 62;
 
     /** Prefixes a stored delayed job, ahead of the generation it was written under. */
     private const DELAYED_MAGIC = 'RQD1';
+
+    /**
+     * How many empty slots one pop may kill before it says jobs are vanishing.
+     * A push caught mid-write leaves one; a run this long is records gone.
+     */
+    private const HOLE_RUN = 64;
+
+    /**
+     * How many slots one pop looks at before giving up for now. Losing a
+     * lease race is not a hole - another worker got the job - so it counts
+     * here, and running out means come back later, not that anything is lost.
+     */
+    private const MAX_STEPS = 1024;
 
     /** @var array<string, int> */
     protected array $holes = [];
@@ -86,8 +101,9 @@ class RostamQueue extends Queue implements QueueContract
      * @param  int  $sweepSeconds  how many seconds of delayed buckets one pop
      *                             may migrate; bounds the work a long-idle
      *                             queue does when it wakes up
-     * @param  int  $reclaimBatch  how many ids one pop may examine looking for
-     *                             abandoned work
+     * @param  int  $reclaimBatch  how many ids one pop examines, above the
+     *                             oldest job still in flight, for work whose
+     *                             worker died
      * @param  int  $tombstoneTtl  how long a killed slot stays killed; a push
      *                             paused longer than this between drawing its id
      *                             and writing its payload is the one delay the
@@ -103,8 +119,10 @@ class RostamQueue extends Queue implements QueueContract
         ?string $owner = null,
         protected int $tombstoneTtl = 604800,
         protected ?EvictionWatch $watch = null,
+        ?bool $dispatchAfterCommit = null,
     ) {
         $this->owner = $owner ?? bin2hex(random_bytes(12));
+        $this->dispatchAfterCommit = $dispatchAfterCommit;
     }
 
     /**
@@ -112,16 +130,15 @@ class RostamQueue extends Queue implements QueueContract
      */
     public function size($queue = null): int
     {
-        $queue = $this->queueName($queue);
-
         return $this->pendingSize($queue) + $this->delayedSize($queue);
     }
 
     /**
      * How many jobs are ready to run right now.
      *
-     * An upper bound: slots killed while their push re-routed, and jobs being
-     * worked on, sit between head and tail and are counted here.
+     * An upper bound: the ids between the reader and the writer, which include
+     * slots killed while their push re-routed and not yet passed. Jobs being
+     * worked on are not counted - the reader has passed them.
      */
     public function pendingSize($queue = null): int
     {
@@ -133,13 +150,14 @@ class RostamQueue extends Queue implements QueueContract
     /**
      * How many delayed jobs are waiting, however far in the future.
      *
-     * A gauge kept beside the buckets, since the buckets themselves cannot be
-     * enumerated. A worker killed between storing a delayed job and counting it
-     * - or between moving one and uncounting it - leaves it off by one.
+     * A gauge per delayed generation, kept beside the buckets, since the
+     * buckets themselves cannot be enumerated. A worker killed between storing
+     * a delayed job and counting it leaves it off by one.
      */
     public function delayedSize($queue = null): int
     {
-        $raw = $this->client->get($this->key($this->queueName($queue), 'delayed'));
+        $queue = $this->queueName($queue);
+        $raw = $this->client->get($this->gaugeKey($queue, $this->delayedGeneration($queue)));
 
         return ($raw !== null && strlen($raw) === 8) ? max(0, unpack('J', $raw)[1]) : 0;
     }
@@ -229,11 +247,12 @@ class RostamQueue extends Queue implements QueueContract
      * A delayed job waits in the bucket for the second it comes due.
      *
      * Bucketing by due-second is what replaces the sorted set this engine does
-     * not have. Two things route a job straight to the ready queue instead:
+     * not have. Three things send a job straight to the ready queue instead:
      * a second the sweep has already passed (a job due in the past, or a clock
-     * behind the worker's), and a second being swept at this very moment - the
-     * sweep seals a second's id counter before reading it, and a push drawing a
-     * sealed id knows it was too late for that bucket.
+     * behind the worker's), an id drawn after the sweep sealed that second, and
+     * a slot the sweep reached and killed before the payload landed. And once
+     * the job is stored, the push looks at the sweep once more: if it has passed
+     * this second in the meantime, the push moves the job itself.
      *
      * @param  \DateTimeInterface|\DateInterval|int  $delay
      */
@@ -244,9 +263,6 @@ class RostamQueue extends Queue implements QueueContract
         $queue = $this->queueName($queue);
         $due = $this->availableAt($delay);
 
-        // The sweep's seal covers a second while it is being passed. A seal
-        // expires with its tombstones, so a second passed long ago - a job due
-        // in the past - is caught here instead, where the answer is stable.
         if ($due <= $this->swept($queue)) {
             return (string) $this->enqueue($queue, $payload);
         }
@@ -257,15 +273,24 @@ class RostamQueue extends Queue implements QueueContract
             return (string) $this->enqueue($queue, $payload);
         }
 
-        $stored = self::DELAYED_MAGIC.pack('J', $this->delayedGeneration($queue)).$payload;
+        $generation = $this->delayedGeneration($queue);
 
-        if (! $this->client->setNx($this->bucketJobKey($queue, $due, $id), $stored)) {
+        if (! $this->client->setNx($this->bucketJobKey($queue, $due, $id), self::DELAYED_MAGIC.pack('J', $generation).$payload)) {
             // The sweep reached this slot before the payload did and killed it.
             // It has therefore passed this second, so the job is due: run it.
             return (string) $this->enqueue($queue, $payload);
         }
 
-        $this->client->increment($this->key($queue, 'delayed'));
+        $this->client->increment($this->gaugeKey($queue, $generation));
+
+        // The sweep may have passed this second while the job was on its way -
+        // counted the bucket before this id existed, and finished, or finished
+        // so long ago that its seal is gone. Either way no sweep will come back
+        // for it, so this push moves it. If a sweep is moving it right now, the
+        // move lease makes one of them do it.
+        if ($due <= $this->swept($queue)) {
+            $this->moveDelayed($queue, $due, $id);
+        }
 
         return (string) $id;
     }
@@ -281,6 +306,7 @@ class RostamQueue extends Queue implements QueueContract
     {
         $this->watch?->check();
 
+        $name = $this->unrouted($queue);
         $queue = $this->queueName($queue);
 
         $this->migrateDueJobs($queue);
@@ -288,8 +314,9 @@ class RostamQueue extends Queue implements QueueContract
 
         $head = $this->head($queue);
         $tail = $this->tail($queue);
+        $killed = 0;
 
-        for ($attempt = 0; $attempt < 64; $attempt++) {
+        for ($step = 0; $step < self::MAX_STEPS; $step++) {
             $at = $head->value();
 
             if ($at >= $tail->value()) {
@@ -312,6 +339,10 @@ class RostamQueue extends Queue implements QueueContract
                 // empty slot is harmless, but it was never a hole.
                 if ($this->client->setNx($key, self::TOMBSTONE, $this->tombstoneTtl) && $head->advanceFrom($at)) {
                     $this->holes[$queue] = ($this->holes[$queue] ?? 0) + 1;
+
+                    if (++$killed >= self::HOLE_RUN) {
+                        throw JobVanished::tooManyHoles($queue, $killed);
+                    }
                 }
 
                 continue;
@@ -349,11 +380,13 @@ class RostamQueue extends Queue implements QueueContract
             $head->advanceFrom($at);
 
             return new RostamJob(
-                $this->container, $this, $current, $this->connectionName, $queue, $id, $reservation,
+                $this->container, $this, $current, $this->connectionName, $name, $id, $reservation,
             );
         }
 
-        throw JobVanished::tooManyHoles($queue, $this->holes[$queue] ?? 0);
+        // Every step lost a race to another worker. That worker has the job;
+        // this one comes back on its next poll.
+        return null;
     }
 
     /**
@@ -365,8 +398,10 @@ class RostamQueue extends Queue implements QueueContract
      *
      * The walk needs no scan because the ids are dense: every slot below the
      * reader was either claimed or killed, so an empty one there is a finished
-     * job. The cursor stops at the first job still legitimately in flight and
-     * resumes from there.
+     * job. Each pop reads a window of them in two round trips - payloads, then
+     * leases - and looks past a job still in flight, so one long-running job
+     * does not hold back the redelivery of every abandoned one above it. The
+     * cursor itself only moves across slots that are settled.
      *
      * Putting a job back is claimed first, with the job's own lease, so two
      * workers passing the same abandoned job do not both requeue it. The copy
@@ -376,51 +411,73 @@ class RostamQueue extends Queue implements QueueContract
     protected function redeliverAbandonedJobs(string $queue): void
     {
         $cursor = new Cursor($this->client, $this->key($queue, 'reclaim'));
-        $upTo = $this->head($queue)->value();
+        $start = $cursor->value();
+        $end = min($start + $this->reclaimBatch, $this->head($queue)->value());
 
-        for ($seen = 0; $seen < $this->reclaimBatch; $seen++) {
-            $at = $cursor->value();
+        if ($start >= $end) {
+            return;
+        }
 
-            if ($at >= $upTo) {
-                return;
+        $ids = range($start + 1, $end);
+        $jobKeys = array_map(fn (int $id) => $this->jobKey($queue, $id), $ids);
+        $leaseKeys = array_map(fn (int $id) => $this->leaseKey($queue, $id), $ids);
+
+        $payloads = $this->client->getMany($jobKeys);
+        $leases = $this->client->getMany($leaseKeys);
+        $settledSoFar = true;
+
+        foreach ($ids as $index => $id) {
+            $payload = $payloads[$jobKeys[$index]] ?? null;
+            $settled = $payload === null || $payload === self::TOMBSTONE;
+
+            if (! $settled && ($leases[$leaseKeys[$index]] ?? null) === null) {
+                $settled = $this->redeliver($queue, $id);
             }
 
-            $id = $at + 1;
-            $key = $this->jobKey($queue, $id);
-            $payload = $this->client->get($key);
-
-            if ($payload === null || $payload === self::TOMBSTONE) {
-                $cursor->advanceFrom($at);          // finished, or a slot that was killed
+            if (! $settled) {
+                // Still worked on, or being put back by somebody else. Look
+                // past it, but the cursor stays behind it.
+                $settledSoFar = false;
 
                 continue;
             }
 
-            $lease = $this->reservation($queue, $id);
-
-            if (! $lease->take($this->retryAfter)) {
-                return;                              // still worked on, or being put back by someone else
+            if ($settledSoFar) {
+                $cursor->advanceFrom($id - 1);
             }
+        }
+    }
 
-            $payload = $this->client->get($key);
+    /**
+     * Put one abandoned job back. True once the slot is settled - put back, or
+     * found finished after all; false when another worker holds its lease.
+     */
+    protected function redeliver(string $queue, int $id): bool
+    {
+        $key = $this->jobKey($queue, $id);
+        $lease = $this->reservation($queue, $id);
 
-            if ($payload === null || $payload === self::TOMBSTONE) {
-                // Its original worker finished it after all, just late.
-                $lease->release();
-                $cursor->advanceFrom($at);
+        if (! $lease->take($this->retryAfter)) {
+            return false;
+        }
 
-                continue;
-            }
+        // Read again under the lease: its original worker may have finished it
+        // after all, just late, between the look and the lease.
+        $payload = $this->client->get($key);
 
+        if ($payload !== null && $payload !== self::TOMBSTONE) {
             // A worker died holding this job. That is an attempt, or a job
             // that kills its worker would be retried forever and never reach
             // maxTries.
             $this->enqueue($queue, self::withAnotherAttempt($payload));
             $this->client->del($key);
-            $lease->release();
-            $cursor->advanceFrom($at);
 
             $this->redelivered[$queue] = ($this->redelivered[$queue] ?? 0) + 1;
         }
+
+        $lease->release();
+
+        return true;
     }
 
     /**
@@ -429,7 +486,7 @@ class RostamQueue extends Queue implements QueueContract
      */
     public function reservation(string $queue, int $id): Reservation
     {
-        return new Reservation($this->client, $this->prefix.$queue.':lease:'.$id, $this->owner);
+        return new Reservation($this->client, $this->leaseKey($queue, $id), $this->owner);
     }
 
     /**
@@ -438,14 +495,14 @@ class RostamQueue extends Queue implements QueueContract
      */
     public function complete(string $queue, int $id, Reservation $reservation): void
     {
-        $this->client->del($this->jobKey($queue, $id));
+        $this->client->del($this->jobKey($this->queueName($queue), $id));
         $reservation->release();
     }
 
     /**
      * How many abandoned jobs this instance has handed back.
      */
-    public function redeliveredCount(?string $queue = null): int
+    public function redeliveredCount($queue = null): int
     {
         return $this->redelivered[$this->queueName($queue)] ?? 0;
     }
@@ -453,32 +510,45 @@ class RostamQueue extends Queue implements QueueContract
     /**
      * Delete every job on a queue, waiting and delayed. Returns how many went.
      *
-     * Ready jobs are deleted outright. Delayed ones cannot be found - their
-     * buckets cannot be enumerated - so they are orphaned instead: the delayed
-     * generation moves on, and a job stored under the old one is deleted rather
-     * than delivered when the sweep reaches its second. A job enqueued while
-     * the clear is running may land on either side of it.
+     * Waiting jobs are overwritten with tombstones rather than deleted, slot by
+     * slot up to the writer: a push that has drawn one of those ids and not yet
+     * written finds its slot killed and draws a fresh one past the clear, where
+     * it is delivered. Deleting instead left such a push free to land behind
+     * the reader, delivered by nobody and cleared by nobody.
+     *
+     * Delayed jobs cannot be found - their buckets cannot be enumerated - so
+     * they are orphaned instead: the delayed generation moves on, and a job
+     * stored under an older one is deleted rather than delivered when the sweep
+     * reaches its second. A job enqueued while the clear is running may land on
+     * either side of it.
+     *
+     * A job a worker is running when the queue is cleared finishes normally.
+     *
+     * @param  \UnitEnum|string|null  $queue
      */
-    public function clear(?string $queue = null): int
+    public function clear($queue = null): int
     {
         $queue = $this->queueName($queue);
         $at = $this->tail($queue)->value();
+        $removed = 0;
 
-        $keys = [];
         for ($id = $this->head($queue)->value() + 1; $id <= $at; $id++) {
-            $keys[] = $this->jobKey($queue, $id);
+            $previous = $this->client->getset($this->jobKey($queue, $id), self::TOMBSTONE, $this->tombstoneTtl);
+
+            if ($previous !== null && $previous !== self::TOMBSTONE) {
+                $removed++;
+            }
         }
 
-        $removed = $keys === [] ? 0 : count(array_filter($this->client->delMany($keys)));
+        $generation = $this->delayedGeneration($queue);
         $delayed = $this->delayedSize($queue);
 
-        // Move the reader up to the writer, and never back: the ids already
-        // handed out stay spent, so a push still in flight cannot land in a
-        // slot the reader has passed without a worker killing it first.
+        // Move the reader up to the writer, and never back: a concurrent worker
+        // may already be further along.
         $this->head($queue)->advanceTo($at);
 
         $this->client->increment($this->key($queue, 'dgen'));
-        $this->client->put($this->key($queue, 'delayed'), pack('J', 0));
+        $this->client->del($this->gaugeKey($queue, $generation));
 
         return $removed + $delayed;
     }
@@ -500,24 +570,30 @@ class RostamQueue extends Queue implements QueueContract
             return;
         }
 
-        $generation = $this->delayedGeneration($queue);
         $cursor = new Cursor($this->client, $this->key($queue, 'swept'));
 
         for ($second = $swept + 1; $second <= $until; $second++) {
-            if (! $this->migrateSecond($queue, $second, $generation)) {
+            if (! $this->migrateSecond($queue, $second)) {
                 // A job in this second belongs to another worker's move. Stop
                 // here rather than mark the second done under it.
                 return;
             }
 
             $cursor->advanceTo($second);
+
+            // The seal was needed only until the watermark passed this second.
+            // From here a push that draws an id for it - even a fresh one - sees
+            // the watermark after storing and moves its own job. Deleting it
+            // keeps the keyspace to the seconds still ahead; a worker dying
+            // right here leaves one sealed counter behind.
+            $this->client->del($this->bucketTailKey($queue, $second));
         }
     }
 
     /**
      * Seal one second, then move every job in it. True when nothing is left.
      */
-    protected function migrateSecond(string $queue, int $second, int $generation): bool
+    protected function migrateSecond(string $queue, int $second): bool
     {
         $count = $this->seal($queue, $second);
         $resolved = true;
@@ -539,44 +615,57 @@ class RostamQueue extends Queue implements QueueContract
                 continue;
             }
 
-            $move = new Reservation($this->client, $this->prefix.$queue.':mig:'.$second.':'.$id, $this->owner);
-
-            if (! $move->take($this->retryAfter)) {
+            if (! $this->moveDelayed($queue, $second, $id)) {
                 $resolved = false;                   // another worker is moving it
-
-                continue;
             }
-
-            $stored = $this->client->get($key);
-
-            if ($stored !== null && $stored !== self::TOMBSTONE) {
-                [$writtenUnder, $payload] = self::unwrapDelayed($stored);
-
-                if ($writtenUnder !== null && $writtenUnder !== $generation) {
-                    $this->client->del($key);        // cleared before it came due
-                } else {
-                    // Copy first, delete after: a worker dying in between leaves
-                    // the original for the next sweep to move again, never nothing.
-                    $this->enqueue($queue, $payload);
-                    $this->client->del($key);
-
-                    if ($writtenUnder !== null) {
-                        $this->client->increment($this->key($queue, 'delayed'), -1);
-                    }
-                }
-            }
-
-            $move->release();
-        }
-
-        // Only now may the seal expire. It is also the only record of how many
-        // ids this second handed out, so while any of them is still unmoved,
-        // letting it lapse would leave those jobs where no sweep could count to.
-        if ($resolved) {
-            $this->client->expire($this->bucketTailKey($queue, $second), $this->tombstoneTtl);
         }
 
         return $resolved;
+    }
+
+    /**
+     * Move one stored delayed job to the ready queue - or, if a clear came after
+     * it, delete it. True when this worker settled it; false when another holds
+     * its move.
+     */
+    protected function moveDelayed(string $queue, int $second, int $id): bool
+    {
+        $move = new Reservation($this->client, $this->prefix.$queue.':mig:'.$second.':'.$id, $this->owner);
+
+        if (! $move->take($this->retryAfter)) {
+            return false;
+        }
+
+        // Read again under the lease: another worker may have moved it between
+        // the look and the lease, and moving it again would run it twice.
+        $key = $this->bucketJobKey($queue, $second, $id);
+        $stored = $this->client->get($key);
+
+        if ($stored !== null && $stored !== self::TOMBSTONE) {
+            [$writtenUnder, $payload] = self::unwrapDelayed($stored);
+
+            // The generation is read now, under the lease, not once per sweep. A
+            // sweep that read it before a clear would otherwise take a job
+            // delayed after the clear for one written before it, and delete it.
+            if ($writtenUnder !== null && $writtenUnder < $this->delayedGeneration($queue)) {
+                $this->client->del($key);            // cleared before it came due
+            } else {
+                // Copy first, delete after: a worker dying in between leaves
+                // the original for the next sweep to move again, never nothing.
+                $this->enqueue($queue, $payload);
+                $this->client->del($key);
+
+                if ($writtenUnder !== null) {
+                    // With a TTL, which applies only if this creates the key: a
+                    // clear may have removed this generation's gauge meanwhile.
+                    $this->client->increment($this->gaugeKey($queue, $writtenUnder), -1, $this->tombstoneTtl);
+                }
+            }
+        }
+
+        $move->release();
+
+        return true;
     }
 
     /**
@@ -584,8 +673,8 @@ class RostamQueue extends Queue implements QueueContract
      *
      * After this, any id drawn for that second carries SEALED, and the push
      * that drew it sends its job to the ready queue. No TTL here: the counter
-     * is the only record of how many jobs the second holds, so it may expire
-     * only once every one of them has been moved - see migrateSecond().
+     * is the only record of how many jobs the second holds, so it goes only
+     * once the watermark has passed the second - see migrateDueJobs().
      */
     protected function seal(string $queue, int $second): int
     {
@@ -633,13 +722,13 @@ class RostamQueue extends Queue implements QueueContract
     }
 
     /**
-     * How many empty slots this instance has killed, per queue.
+     * How many empty slots this instance has killed and moved past, per queue.
      *
      * Each is either a push that was caught between drawing its id and writing
      * its payload - it re-routed, and lost nothing - or a record that vanished
      * after it was written. A steady trickle is the first; a run is the second.
      */
-    public function holesSeen(?string $queue = null): int
+    public function holesSeen($queue = null): int
     {
         return $this->holes[$this->queueName($queue)] ?? 0;
     }
@@ -720,9 +809,29 @@ class RostamQueue extends Queue implements QueueContract
         return new Cursor($this->client, $this->key($queue, 'tail'));
     }
 
+    /**
+     * The queue a caller named - an enum's value, or the default - as jobs and
+     * events report it.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     */
+    protected function unrouted($queue): string
+    {
+        return (string) (enum_value($queue) ?: $this->default);
+    }
+
+    /**
+     * The queue whose keys are used: the name after Laravel's queue routes
+     * have forwarded it, as the Redis driver resolves it.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     */
     protected function queueName($queue): string
     {
-        return (string) ($queue ?: $this->default);
+        $name = $this->unrouted($queue);
+
+        // Queue routes arrived during Laravel 12; older releases have none.
+        return method_exists($this, 'resolveQueue') ? (string) $this->resolveQueue($name) : $name;
     }
 
     protected function key(string $queue, string $part): string
@@ -733,6 +842,16 @@ class RostamQueue extends Queue implements QueueContract
     protected function jobKey(string $queue, int $id): string
     {
         return $this->prefix.$queue.':job:'.$id;
+    }
+
+    protected function leaseKey(string $queue, int $id): string
+    {
+        return $this->prefix.$queue.':lease:'.$id;
+    }
+
+    protected function gaugeKey(string $queue, int $generation): string
+    {
+        return $this->prefix.$queue.':delayed:'.$generation;
     }
 
     protected function bucketTailKey(string $queue, int $second): string

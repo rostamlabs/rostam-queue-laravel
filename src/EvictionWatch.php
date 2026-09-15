@@ -16,32 +16,38 @@ use Rostam\Queue\Exceptions\UnsafeQueueStore;
 /**
  * Catches a server that has started losing live records.
  *
- * A queue on Rostam is only as durable as the node never evicting, and whether
- * it evicts is not something the wire reports - a single-node `rostam-server`
- * always evicts at capacity, silently, with every write still answering
- * success. What rostam v0.7.0-beta3 does report is how many LIVE records it has
- * displaced, and on a node that keeps queued jobs that number has exactly one
- * acceptable value: zero.
+ * A queue on Rostam is only as durable as the node never evicting a record it
+ * still holds, and whether it will is not something the wire reports. What
+ * rostam v0.7.0-beta3 does report is how many LIVE records it has displaced,
+ * and on a node that keeps queued jobs that number has exactly one acceptable
+ * value: zero.
  *
- * So it can catch a false declaration, never prove a true one. Zero before the
- * node ever filled up says nothing about what happens when it does. What it
- * does guarantee is that a worker does not go on taking jobs from a node that
- * has already thrown some away.
+ * So it can catch a node that is losing records, never prove one will not.
+ * Zero before the node was ever under pressure says nothing about the day it
+ * is. What it does guarantee is that a worker does not go on taking jobs from
+ * a node that has already thrown some away.
+ *
+ * A refusal for evictions is final for this process. Laravel's worker catches
+ * the exception and pops again a moment later; a check that refused once and
+ * then let the next call through - because the interval had not passed yet -
+ * was a guard that held for exactly one operation. The count cannot go back
+ * down without a server restart, which does not bring back what was lost, so
+ * a refused worker stays refused until it is restarted too.
  *
  * The count is node-wide and cumulative since the server started. Evictions of
- * anyone's keys on that node count, not only jobs - on a node that was declared
- * never to evict, any eviction contradicts the declaration.
+ * anyone's keys on that node count, not only jobs: a node that evicted anything
+ * live can evict a job.
  */
 final class EvictionWatch
 {
     private ?int $checkedAt = null;
 
-    /** Whether this server can report the count at all; null until asked. */
-    private ?bool $supported = null;
+    /** Set once live evictions have been seen, and thrown from then on. */
+    private ?UnsafeQueueStore $refusal = null;
 
     /**
      * @param  bool  $required  refuse a server that cannot report the count,
-     *                          rather than run on the declaration alone
+     *                          rather than run without it
      * @param  int  $everySeconds  how often a running queue re-reads it
      */
     public function __construct(
@@ -58,36 +64,44 @@ final class EvictionWatch
      */
     public function verify(): void
     {
-        $this->checkedAt = (int) Carbon::now()->getTimestamp();
+        if ($this->refusal !== null) {
+            throw $this->refusal;
+        }
 
         $evicted = $this->evictionsLive();
 
         if ($evicted === null) {
-            $this->supported = false;
-
             if ($this->required) {
+                // Not remembered as an answer: the next operation asks again,
+                // so a server that failed to answer once is not refused for
+                // good, and one that never answers is refused every time.
+                $this->checkedAt = null;
+
                 throw UnsafeQueueStore::cannotVerify();
             }
+
+            $this->checkedAt = (int) Carbon::now()->getTimestamp();
 
             return;
         }
 
-        $this->supported = true;
+        $this->checkedAt = (int) Carbon::now()->getTimestamp();
 
         if ($evicted > 0) {
-            throw UnsafeQueueStore::liveRecordsEvicted($evicted);
+            throw $this->refusal = UnsafeQueueStore::liveRecordsEvicted($evicted);
         }
     }
 
     /**
-     * Re-read the count if the interval has passed. Cheap when it has not.
+     * Re-read the count if the interval has passed. Cheap when it has not -
+     * unless a refusal stands, which is thrown every time.
      *
      * @throws UnsafeQueueStore
      */
     public function check(): void
     {
-        if ($this->supported === false) {
-            return;
+        if ($this->refusal !== null) {
+            throw $this->refusal;
         }
 
         $now = (int) Carbon::now()->getTimestamp();

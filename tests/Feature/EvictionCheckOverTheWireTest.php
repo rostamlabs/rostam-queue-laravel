@@ -71,13 +71,15 @@ class EvictionCheckOverTheWireTest extends TestCase
         $this->fakeOnly();
 
         $client = $this->client(liveEvictions: 3);
-        $queue = $this->queue($client, new EvictionWatch($client, required: false));
+        $queue = $this->queue($client, new EvictionWatch($client, required: true));
 
-        try {
-            $queue->pushRaw(json_encode(['id' => 'refused']));
-            $this->fail('a job was accepted by a node that has evicted live records');
-        } catch (UnsafeQueueStore $exception) {
-            $this->assertStringContainsString('has evicted 3 live record(s)', $exception->getMessage());
+        foreach (['first', 'second'] as $attempt) {
+            try {
+                $queue->pushRaw(json_encode(['id' => $attempt]));
+                $this->fail("the {$attempt} push was accepted by a node that has evicted live records");
+            } catch (UnsafeQueueStore $exception) {
+                $this->assertStringContainsString('has evicted 3 live record(s)', $exception->getMessage());
+            }
         }
 
         $this->assertSame(0, $this->queue($client, null)->pendingSize());
@@ -96,53 +98,50 @@ class EvictionCheckOverTheWireTest extends TestCase
     }
 
     /**
-     * An older server answers __kv_metrics__ with its generic error. With
-     * `headroom` that is a refusal - nothing else guards a single node - and
-     * with `reject_writes` it is not, because there the node refuses by itself.
+     * An older server answers __kv_metrics__ with its generic error, and
+     * `headroom` has nothing else to stand on: refused, on every operation.
      */
-    public function test_a_server_that_predates_the_count_refuses_headroom_and_lets_reject_writes_run(): void
+    public function test_a_server_that_predates_the_count_refuses_headroom(): void
     {
         $this->fakeOnly();
 
         $client = $this->client(legacy: true);
+        $watch = new EvictionWatch($client, required: true);
 
-        try {
-            (new EvictionWatch($client, required: true))->verify();
-            $this->fail('headroom ran on a server that cannot report evictions');
-        } catch (UnsafeQueueStore $exception) {
-            $this->assertStringContainsString('rostam v0.7.0-beta3', $exception->getMessage());
+        foreach ([1, 2] as $attempt) {
+            try {
+                $watch->check();
+                $this->fail("headroom ran on a server that cannot report evictions (check {$attempt})");
+            } catch (UnsafeQueueStore $exception) {
+                $this->assertStringContainsString('rostam v0.7.0-beta3', $exception->getMessage());
+            }
         }
-
-        (new EvictionWatch($client, required: false))->verify();
-        $this->addToAssertionCount(1);
     }
 
     /**
      * The same on a real server older than the op, where the error is the
-     * server's and not the fake's idea of it. This is the stable lane in CI.
+     * server's and not the fake's idea of it. This is the stable lane in CI
+     * while the stable rostam predates the count.
      */
-    public function test_a_real_server_that_predates_the_count_refuses_headroom_and_runs_reject_writes(): void
+    public function test_a_real_server_that_predates_the_count_refuses_headroom(): void
     {
         if (! FakeServer::isExternal() || FakeServer::supports('0.7.0-beta3')) {
             $this->markTestSkipped('needs a real rostam-server older than v0.7.0-beta3 (ROSTAM_TEST_SERVER_VERSION)');
         }
 
         $client = $this->client();
+        $queue = $this->queue($client, new EvictionWatch($client, required: true));
 
-        try {
-            $this->queue($client, new EvictionWatch($client, required: true))->pushRaw(json_encode(['id' => 'x']));
-            $this->fail('headroom ran on a server that cannot report evictions');
-        } catch (UnsafeQueueStore $exception) {
-            $this->assertStringContainsString('rostam v0.7.0-beta3', $exception->getMessage());
+        foreach (['push', 'pop'] as $operation) {
+            try {
+                $operation === 'push' ? $queue->pushRaw(json_encode(['id' => 'x'])) : $queue->pop();
+                $this->fail("headroom let a {$operation} through on a server that cannot report evictions");
+            } catch (UnsafeQueueStore $exception) {
+                $this->assertStringContainsString('rostam v0.7.0-beta3', $exception->getMessage());
+            }
         }
 
-        $queue = $this->queue($client, new EvictionWatch($client, required: false));
-        $queue->pushRaw(json_encode(['id' => 'kept']));
-        $job = $queue->pop();
-
-        $this->assertNotNull($job);
-        $this->assertSame('kept', json_decode($job->getRawBody(), true)['id']);
-        $job->delete();
+        $this->assertSame(0, $this->queue($client, null)->pendingSize());
     }
 
     /**

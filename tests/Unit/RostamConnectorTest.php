@@ -15,10 +15,11 @@ use Rostam\Queue\RostamQueue;
 /**
  * The connector's job is to refuse.
  *
- * A single-node rostam-server evicts at capacity, silently, and a queued job is
- * work that was accepted. A queue that starts on such a store and then loses
- * work is worse than one that will not start, so the guard is a hard failure
- * rather than a warning nobody reads.
+ * A single-node rostam-server throws live records away - at capacity, and by
+ * default under churn well before it - and a queued job is work that was
+ * accepted. A queue that starts on such a store and then loses work is worse
+ * than one that will not start, so the guard is a hard failure rather than a
+ * warning nobody reads.
  *
  * Which setup a server is cannot be read off the wire, so the operator
  * declares it; these tests pin that the declaration actually stops something
@@ -35,10 +36,30 @@ class RostamConnectorTest extends TestCase
         ]]);
     }
 
+    /**
+     * @param  array<string, mixed>  $config
+     */
+    private function connect(array $config, ?Repository $shared = null): RostamQueue
+    {
+        $queue = (new RostamConnector($shared ?? $this->config()))->connect($config + [
+            'driver' => 'rostam',
+            'at_cap_policy' => 'headroom',
+        ]);
+
+        $this->assertInstanceOf(RostamQueue::class, $queue);
+
+        return $queue;
+    }
+
+    private static function read(RostamQueue $queue, string $property): mixed
+    {
+        return (new \ReflectionProperty($queue, $property))->getValue($queue);
+    }
+
     public function test_it_refuses_a_connection_that_has_not_declared_its_policy(): void
     {
         $this->expectException(UnsafeQueueStore::class);
-        $this->expectExceptionMessageMatches('/must declare at_cap_policy/');
+        $this->expectExceptionMessageMatches('/must declare at_cap_policy "headroom"/');
 
         (new RostamConnector($this->config()))->connect(['driver' => 'rostam']);
     }
@@ -57,11 +78,8 @@ class RostamConnectorTest extends TestCase
     /**
      * The message has to earn the refusal: an operator meeting it for the first
      * time needs to know what to change and why, not just that something is
-     * wrong.
-     *
-     * It used to tell them to start the server with PolicyRejectWrites, which a
-     * single-node rostam-server cannot be told to do. So it now names the two
-     * setups that are actually safe, and says plainly which one a single node is.
+     * wrong - and "keep max_memory above the backlog" alone was not enough, a
+     * default node evicts waiting records under churn with room to spare.
      */
     public function test_the_refusal_explains_itself(): void
     {
@@ -69,55 +87,50 @@ class RostamConnectorTest extends TestCase
             (new RostamConnector($this->config()))->connect(['driver' => 'rostam']);
             $this->fail('the connector accepted an undeclared policy');
         } catch (UnsafeQueueStore $e) {
-            $this->assertStringContainsString('"reject_writes"', $e->getMessage());
-            $this->assertStringContainsString('"headroom"', $e->getMessage());
-            $this->assertStringContainsString('single-node rostam-server always evicts', $e->getMessage());
-            $this->assertStringNotContainsString('Start the server with PolicyRejectWrites', $e->getMessage());
+            $this->assertStringContainsString('-relocating-eviction', $e->getMessage());
+            $this->assertStringContainsString('eviction follows write order', $e->getMessage());
+            $this->assertStringContainsString('v0.7.0-beta3', $e->getMessage());
+        }
+    }
+
+    /**
+     * A cluster refuses writes instead of evicting, which is what a queue wants
+     * - but it serves reads from any replica, and a lagging replica's "not
+     * found" reads here as a finished job.
+     */
+    public function test_a_cluster_is_refused_with_the_reason(): void
+    {
+        try {
+            (new RostamConnector($this->config()))->connect([
+                'driver' => 'rostam',
+                'at_cap_policy' => 'reject_writes',
+            ]);
+            $this->fail('the connector built a queue on a -cluster');
+        } catch (UnsafeQueueStore $e) {
+            $this->assertStringContainsString('whichever replica', $e->getMessage());
         }
     }
 
     public function test_a_single_node_with_headroom_can_be_declared(): void
     {
-        $queue = (new RostamConnector($this->config()))->connect([
-            'driver' => 'rostam',
-            'at_cap_policy' => 'headroom',
-        ]);
-
-        $this->assertInstanceOf(RostamQueue::class, $queue);
-    }
-
-    public function test_it_builds_a_queue_once_the_policy_is_declared(): void
-    {
-        $queue = (new RostamConnector($this->config()))->connect([
-            'driver' => 'rostam',
-            'at_cap_policy' => 'reject_writes',
-        ]);
-
-        $this->assertInstanceOf(RostamQueue::class, $queue);
+        $this->connect([]);
     }
 
     public function test_it_takes_the_server_from_the_shared_rostam_config(): void
     {
         // One server, described once - the cache driver already puts its
         // connections there and a queue should not need a second copy.
-        $queue = (new RostamConnector($this->config(['other' => ['host' => '10.0.0.9', 'port' => 7001]])))
-            ->connect([
-                'driver' => 'rostam',
-                'connection' => 'other',
-                'at_cap_policy' => 'reject_writes',
-            ]);
+        $queue = $this->connect(
+            ['connection' => 'other'],
+            $this->config(['other' => ['host' => '10.0.0.9', 'port' => 7001]]),
+        );
 
         $this->assertSame('tcp://10.0.0.9:7001', $queue->getClient()->config()->uri());
     }
 
     public function test_an_inline_host_wins_over_the_shared_config(): void
     {
-        $queue = (new RostamConnector($this->config()))->connect([
-            'driver' => 'rostam',
-            'host' => '10.0.0.5',
-            'port' => 7002,
-            'at_cap_policy' => 'reject_writes',
-        ]);
+        $queue = $this->connect(['host' => '10.0.0.5', 'port' => 7002]);
 
         $this->assertSame('tcp://10.0.0.5:7002', $queue->getClient()->config()->uri());
     }
@@ -130,17 +143,31 @@ class RostamConnectorTest extends TestCase
      */
     public function test_each_setting_reaches_the_queue_under_its_own_name(): void
     {
-        $queue = (new RostamConnector($this->config()))->connect([
-            'driver' => 'rostam',
-            'at_cap_policy' => 'reject_writes',
+        $queue = $this->connect([
             'retry_after' => 600,
             'sweep_seconds' => 5,
+            'reclaim_batch' => 7,
+            'tombstone_ttl' => 3600,
+            'queue' => 'emails',
+            'prefix' => 'app:',
         ]);
 
-        $read = static fn (string $property) => (new \ReflectionProperty($queue, $property))->getValue($queue);
+        $this->assertSame(600, self::read($queue, 'retryAfter'), 'retry_after did not become the lease');
+        $this->assertSame(5, self::read($queue, 'sweepSeconds'), 'sweep_seconds did not reach the migration window');
+        $this->assertSame(7, self::read($queue, 'reclaimBatch'));
+        $this->assertSame(3600, self::read($queue, 'tombstoneTtl'));
+        $this->assertSame('emails', self::read($queue, 'default'));
+        $this->assertSame('app:', self::read($queue, 'prefix'));
+    }
 
-        $this->assertSame(600, $read('retryAfter'), 'retry_after did not become the lease');
-        $this->assertSame(5, $read('sweepSeconds'), 'sweep_seconds did not reach the migration window');
+    /**
+     * `after_commit` is Laravel's own connection option: a job dispatched inside
+     * a database transaction waits for the commit. It used to be ignored.
+     */
+    public function test_after_commit_reaches_the_queue(): void
+    {
+        $this->assertTrue(self::read($this->connect(['after_commit' => true]), 'dispatchAfterCommit'));
+        $this->assertNull(self::read($this->connect([]), 'dispatchAfterCommit'));
     }
 
     public function test_it_says_which_connection_is_missing(): void
@@ -148,10 +175,6 @@ class RostamConnectorTest extends TestCase
         $this->expectException(UnsafeQueueStore::class);
         $this->expectExceptionMessageMatches('/no connection named \[nowhere\]/');
 
-        (new RostamConnector($this->config()))->connect([
-            'driver' => 'rostam',
-            'connection' => 'nowhere',
-            'at_cap_policy' => 'reject_writes',
-        ]);
+        $this->connect(['connection' => 'nowhere']);
     }
 }

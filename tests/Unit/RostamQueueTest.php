@@ -7,6 +7,8 @@ declare(strict_types=1);
 namespace Rostam\Queue\Tests\Unit;
 
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Queue\ClearableQueue;
+use Illuminate\Queue\QueueRoutes;
 use PHPUnit\Framework\TestCase;
 use Rostam\Queue\Exceptions\JobVanished;
 use Rostam\Queue\RostamQueue;
@@ -234,8 +236,9 @@ class RostamQueueTest extends TestCase
     }
 
     /**
-     * One hole is a dead worker. A run of them is the store dropping jobs, and
-     * a queue that quietly skips missing work looks healthy while it loses.
+     * One hole is a push caught mid-write. A run of them is the store dropping
+     * jobs, and a queue that quietly skips missing work looks healthy while it
+     * loses.
      */
     public function test_a_run_of_holes_is_reported_rather_than_skipped(): void
     {
@@ -249,7 +252,7 @@ class RostamQueueTest extends TestCase
         }
 
         $this->expectException(JobVanished::class);
-        $this->expectExceptionMessageMatches('/met \d+ empty slots in a single pop.*rostam_kv_evictions_live_total/s');
+        $this->expectExceptionMessageMatches('/killed \d+ empty slots in a single pop.*rostam_kv_evictions_live_total/s');
 
         $this->queue->pop();
     }
@@ -267,7 +270,8 @@ class RostamQueueTest extends TestCase
 
     /**
      * Clearing moves the reader up to the writer rather than resetting both, so
-     * a push already in flight cannot land in a slot the reader has passed.
+     * the ids already handed out stay spent and a later push is still read.
+     * (A push already in flight is JobLossRacesTest's.)
      */
     public function test_clear_does_not_strand_a_later_push(): void
     {
@@ -300,4 +304,76 @@ class RostamQueueTest extends TestCase
         $this->assertNull($this->queue->pop('reports'));
         $this->assertNotNull($this->queue->pop('emails'));
     }
+
+    /**
+     * `php artisan queue:clear` only works on a queue that says it can be
+     * cleared. This one could, and did not say so.
+     */
+    public function test_queue_clear_can_reach_it(): void
+    {
+        $this->assertInstanceOf(ClearableQueue::class, $this->queue);
+    }
+
+    /**
+     * A job being worked on is not waiting: the reader has passed it.
+     */
+    public function test_a_job_being_worked_on_is_not_counted_as_pending(): void
+    {
+        $this->queue->pushRaw(json_encode(['id' => 'held']));
+        $this->queue->pushRaw(json_encode(['id' => 'waiting']));
+
+        $this->assertNotNull($this->queue->pop());
+
+        $this->assertSame(1, $this->queue->pendingSize());
+    }
+
+    /**
+     * Laravel accepts a backed enum wherever it takes a queue name.
+     */
+    public function test_an_enum_names_the_same_queue_as_its_value(): void
+    {
+        $this->queue->pushRaw(json_encode(['id' => 'by-enum']), QueueName::Emails);
+
+        $job = $this->queue->pop('emails');
+
+        $this->assertNotNull($job);
+        $this->assertSame('emails', $job->getQueue());
+    }
+
+    /**
+     * Queue routes forward one queue name to another, and the Redis driver
+     * resolves them for its keys. So does this one: a job pushed to the old
+     * name is read from the new one, and a job knows the name it was asked for.
+     */
+    public function test_a_forwarded_queue_is_stored_under_its_destination(): void
+    {
+        if (! class_exists(QueueRoutes::class)) {
+            $this->markTestSkipped('queue routes are not in this Laravel release');
+        }
+
+        $routes = new QueueRoutes;
+        $routes->forward('legacy', 'current');
+        $container = Container::getInstance();
+        $container->instance('queue.routes', $routes);
+
+        try {
+            $this->queue->pushRaw(json_encode(['id' => 'forwarded']), 'legacy');
+
+            $this->assertArrayHasKey('q:current:job:1', $this->client->all());
+
+            $job = $this->queue->pop('legacy');
+            $this->assertNotNull($job);
+            $this->assertSame('legacy', $job->getQueue());
+
+            $job->delete();
+            $this->assertArrayNotHasKey('q:current:job:1', $this->client->all());
+        } finally {
+            $container->forgetInstance('queue.routes');
+        }
+    }
+}
+
+enum QueueName: string
+{
+    case Emails = 'emails';
 }

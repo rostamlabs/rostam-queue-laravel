@@ -43,6 +43,16 @@ class JobLossRacesTest extends TestCase
         $this->client = new InterleavingClient($this->store);
     }
 
+    /**
+     * Every window a test opened must actually have opened. A hook that never
+     * fired means the interleaving never happened, and a green test here would
+     * be a test of nothing.
+     */
+    protected function assertPostConditions(): void
+    {
+        $this->assertSame([], $this->client->pendingHooks(), 'a hook never fired, so its interleaving never happened');
+    }
+
     protected function tearDown(): void
     {
         Carbon::setTestNow();
@@ -50,9 +60,13 @@ class JobLossRacesTest extends TestCase
         parent::tearDown();
     }
 
-    private function worker(string $owner): RostamQueue
+    /**
+     * A worker on the hooked client, or - for a rival whose own operations
+     * must not trip the hooks - straight on the store.
+     */
+    private function worker(string $owner, bool $hooked = true): RostamQueue
     {
-        $queue = new RostamQueue($this->client, 'q:', 'default', retryAfter: 30, owner: $owner);
+        $queue = new RostamQueue($hooked ? $this->client : $this->store, 'q:', 'default', retryAfter: 30, owner: $owner);
         $queue->setContainer(new Container);
         $queue->setConnectionName('rostam');
 
@@ -209,7 +223,7 @@ class JobLossRacesTest extends TestCase
         $queue = $this->worker('operator');
         $queue->pushRaw(self::job('before'));
 
-        $this->client->before('delMany', 'q:default:job:', function () {
+        $this->client->before('getset|delMany', 'q:default:job:', function () {
             $worker = $this->worker('busy');
             $worker->pushRaw(self::job('during-1'));
             $worker->pushRaw(self::job('during-2'));
@@ -389,6 +403,287 @@ class JobLossRacesTest extends TestCase
         $delivered = array_merge($delivered, $this->drain($this->worker('healthy')));
 
         $this->assertSame(['once'], $delivered);
+    }
+
+    /**
+     * A sweep used to read the delayed generation once, before its loop. A
+     * clear() finishing while that sweep was on its way, followed by a job
+     * delayed into the very second being swept, looked to the sweep like a job
+     * written before the clear - and it deleted it. The job was accepted after
+     * the clear had returned.
+     */
+    public function test_a_job_delayed_after_a_clear_is_not_taken_for_one_it_cleared(): void
+    {
+        $this->worker('warm-up')->pop();
+        Carbon::setTestNow(Carbon::now()->addSecond());
+        $second = Carbon::now()->getTimestamp();
+
+        $this->client->before('get', 'q:default:d:'.$second.':tail', function () {
+            $this->worker('operator')->clear();
+            $this->worker('producer')->laterRaw(0, self::job('after-clear'));
+        });
+
+        $this->worker('sweeper')->pop();
+
+        $this->assertSame(['after-clear'], $this->drain($this->worker('healthy')));
+        $this->assertSame(0, $this->worker('monitor')->size());
+    }
+
+    /**
+     * A clear() in the middle of a move used to zero a gauge that the move
+     * then decremented, driving it below zero - and every delayed job after
+     * that read as none.
+     */
+    public function test_a_clear_during_a_move_does_not_hide_later_delayed_jobs(): void
+    {
+        $this->worker('warm-up')->pop();
+        $this->worker('producer')->laterRaw(1, self::job('moving'));
+        Carbon::setTestNow(Carbon::now()->addSeconds(2));
+
+        $this->client->before('del', ':d:', function () {
+            $this->worker('operator')->clear();
+        });
+
+        $this->worker('sweeper')->pop();
+
+        $later = $this->worker('producer-2');
+        $later->laterRaw(3600, self::job('an-hour-away'));
+
+        $this->assertSame(1, $later->delayedSize());
+    }
+
+    /**
+     * A push that had drawn its id when the queue was cleared used to write
+     * into a slot the reader had already jumped past - delivered by nobody,
+     * cleared by nobody. clear() now kills every slot it passes, so the push
+     * draws a fresh id beyond the clear.
+     */
+    public function test_a_push_straddling_a_clear_is_delivered_not_orphaned(): void
+    {
+        $this->client->before('setNx', 'q:default:job:1', function () {
+            $this->worker('operator')->clear();
+            $this->worker('passer')->pop();
+        });
+
+        $this->worker('producer')->pushRaw(self::job('straddler'));
+
+        $this->assertSame(['straddler'], $this->drain($this->worker('healthy')));
+        $this->assertSame(0, $this->worker('monitor')->size());
+    }
+
+    /**
+     * Losing lease races is not losing jobs. A pop used to give up after 64
+     * steps of any kind and report "jobs were written and then vanished" with
+     * zero holes - on a healthy queue, under nothing but contention.
+     */
+    public function test_losing_lease_races_is_not_reported_as_vanished_jobs(): void
+    {
+        // The rival works on the store directly, so each hook fires for one of
+        // the slow worker's lease attempts and not inside the rival's own.
+        $rival = $this->worker('rival', hooked: false);
+
+        for ($i = 0; $i < 70; $i++) {
+            $rival->pushRaw(self::job('j'.$i));
+        }
+
+        for ($i = 0; $i < 64; $i++) {
+            $this->client->before('setNx', ':lease:', static function () use ($rival) {
+                $rival->pop();
+            });
+        }
+
+        $job = $this->worker('slow')->pop();
+
+        $this->assertNotNull($job, 'a worker that lost 64 races found nothing, with jobs waiting');
+    }
+
+    /**
+     * One job still running used to block the redelivery of every abandoned job
+     * above it: the walk stopped at the first live lease.
+     */
+    public function test_an_abandoned_job_is_redelivered_while_an_older_one_is_still_running(): void
+    {
+        $producer = $this->worker('producer');
+        $producer->pushRaw(self::job('long-running'));
+        $producer->pushRaw(self::job('abandoned'));
+
+        $running = $this->worker('alive')->pop();
+        $this->worker('dies')->pop();
+        $this->store->ageOut('q:default:lease:2');
+
+        $next = $this->worker('next')->pop();
+
+        $this->assertNotNull($running);
+        $this->assertNotNull($next, 'the abandoned job waited behind one still running');
+        $this->assertSame('abandoned', json_decode($next->getRawBody(), true)['id']);
+    }
+
+    /**
+     * An idle queue used to leave a sealed counter behind for every second it
+     * swept, each living a week. The seal is needed only until the watermark
+     * passes its second.
+     */
+    public function test_sweeping_idle_seconds_leaves_no_keys_behind(): void
+    {
+        $worker = $this->worker('idle');
+
+        for ($elapsed = 0; $elapsed <= 3600; $elapsed += 30) {
+            Carbon::setTestNow(Carbon::createFromTimestamp(1_800_000_000 + $elapsed));
+            $worker->pop();
+        }
+
+        $buckets = array_filter(array_keys($this->store->all()), static fn (string $key) => str_contains($key, ':d:'));
+
+        $this->assertSame([], array_values($buckets));
+    }
+
+    /**
+     * The interleaving the seal exists for now that a push checks the watermark
+     * after storing: the sweep has counted the second and not yet moved the
+     * watermark past it. A push drawing an id in that gap would store a job the
+     * sweep never counted and still see the watermark behind its second. The
+     * seal makes that id carry SEALED, and the push goes to the ready queue.
+     */
+    public function test_a_delayed_push_between_the_sweep_counting_a_second_and_passing_it_is_not_lost(): void
+    {
+        // The sweep starts one second short of $due, so the watermark's move
+        // the hook catches is the one past $due itself.
+        $due = Carbon::now()->getTimestamp() + 5;
+        Carbon::setTestNow(Carbon::createFromTimestamp($due - 1));
+        $this->worker('warm-up')->pop();
+        Carbon::setTestNow(Carbon::createFromTimestamp($due));
+
+        $this->client->before('cas', 'q:default:swept', function () use ($due) {
+            $this->worker('producer')->laterRaw(Carbon::createFromTimestamp($due), self::job('in-the-gap'));
+        });
+
+        $this->worker('sweeper')->pop();
+
+        $this->assertSame(['in-the-gap'], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * A second whose jobs are not all moved - one is under another worker's
+     * move - keeps its counter, which is the only record of how many ids it
+     * handed out. Dropping it then would leave the unmoved job where no later
+     * sweep could count to.
+     */
+    public function test_a_second_still_being_moved_keeps_its_count_until_every_job_is_out(): void
+    {
+        $this->worker('warm-up')->pop();
+        $producer = $this->worker('producer');
+        $producer->laterRaw(3, self::job('first'));
+        $producer->laterRaw(3, self::job('second'));
+        $due = Carbon::now()->getTimestamp() + 3;
+        Carbon::setTestNow(Carbon::createFromTimestamp($due + 1));
+
+        // Another worker is part-way through moving the second job, and dies.
+        $this->store->put('q:default:mig:'.$due.':2', 'a-worker-that-died', 30);
+
+        $this->worker('sweeper')->pop();
+        $this->everyWorkerIsGone();
+
+        $delivered = $this->drain($this->worker('healthy'));
+        sort($delivered);
+
+        $this->assertSame(['first', 'second'], $delivered);
+    }
+
+    /**
+     * Two sweepers reaching the same delayed job: without its move lease both
+     * would copy it to the ready queue, and the queue itself would run it twice.
+     */
+    public function test_two_sweepers_on_one_delayed_job_move_it_once(): void
+    {
+        $this->worker('warm-up')->pop();
+        $this->worker('producer')->laterRaw(1, self::job('moved-once'));
+        Carbon::setTestNow(Carbon::now()->addSeconds(2));
+
+        $delivered = [];
+
+        $this->client->before('increment', 'q:default:tail', function () use (&$delivered) {
+            if ($job = $this->worker('rival-sweeper')->pop()) {
+                $delivered[] = json_decode($job->getRawBody(), true)['id'];
+                $job->delete();
+            }
+        });
+
+        if ($job = $this->worker('sweeper')->pop()) {
+            $delivered[] = json_decode($job->getRawBody(), true)['id'];
+            $job->delete();
+        }
+
+        $this->assertSame(['moved-once'], array_merge($delivered, $this->drain($this->worker('healthy'))));
+    }
+
+    /**
+     * Between a sweeper looking at a delayed job and taking its move lease,
+     * another can move it entirely. Moving what was read before the lease would
+     * put it on the ready queue a second time.
+     */
+    public function test_a_delayed_job_moved_by_another_worker_before_the_lease_is_not_moved_again(): void
+    {
+        $this->worker('warm-up')->pop();
+        $this->worker('producer')->laterRaw(1, self::job('moved-once'));
+        Carbon::setTestNow(Carbon::now()->addSeconds(2));
+
+        $delivered = [];
+
+        $this->client->before('setNx', ':mig:', function () use (&$delivered) {
+            if ($job = $this->worker('faster')->pop()) {
+                $delivered[] = json_decode($job->getRawBody(), true)['id'];
+                $job->delete();
+            }
+        });
+
+        if ($job = $this->worker('slower')->pop()) {
+            $delivered[] = json_decode($job->getRawBody(), true)['id'];
+            $job->delete();
+        }
+
+        $this->assertSame(['moved-once'], array_merge($delivered, $this->drain($this->worker('healthy'))));
+    }
+
+    /**
+     * A worker whose lease lapsed can still finish its job, late - between
+     * redelivery seeing the job unheld and taking its lease. Putting back what
+     * was seen before the lease would run a finished job again.
+     */
+    public function test_a_job_finished_late_is_not_redelivered(): void
+    {
+        $this->worker('producer')->pushRaw(self::job('finished-late'));
+        $slow = $this->worker('slow')->pop();
+        $this->store->ageOut('q:default:lease:1');
+
+        $this->client->before('setNx', 'q:default:lease:1', static function () use ($slow) {
+            $slow->delete();
+        });
+
+        $this->assertNull($this->worker('reclaimer')->pop());
+        $this->assertSame([], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * A worker killed while putting an abandoned job back must not take it
+     * along: the copy is written before the original goes.
+     */
+    public function test_a_worker_killed_while_putting_back_an_abandoned_job_does_not_lose_it(): void
+    {
+        $this->worker('producer')->pushRaw(self::job('abandoned'));
+        $this->worker('died-holding-it')->pop();
+        $this->everyWorkerIsGone();
+
+        $this->client->before('increment', 'q:default:tail', InterleavingClient::dies());
+
+        try {
+            $this->worker('also-dies')->pop();
+            $this->fail('the worker was supposed to die while putting the job back');
+        } catch (WorkerDied) {
+        }
+
+        $this->everyWorkerIsGone();
+
+        $this->assertSame(['abandoned'], $this->drain($this->worker('healthy')));
     }
 
     /**

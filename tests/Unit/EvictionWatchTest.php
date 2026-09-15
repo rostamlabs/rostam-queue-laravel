@@ -140,11 +140,10 @@ class EvictionWatchTest extends TestCase
     }
 
     /**
-     * "reject_writes" names a node that refuses at capacity. Its safety does
-     * not depend on the count, so a server too old to report it runs on the
-     * declaration alone.
+     * A watch told the count is optional runs on a server too old to report
+     * it. (The connector never builds one: "headroom" requires the count.)
      */
-    public function test_a_declaration_that_does_not_need_the_count_runs_without_it(): void
+    public function test_a_watch_that_does_not_need_the_count_runs_without_it(): void
     {
         $store = new ArrayKvClient;
         $queue = $this->queue(self::olderServer($store), required: false);
@@ -155,9 +154,9 @@ class EvictionWatchTest extends TestCase
     }
 
     /**
-     * "headroom" names a single node that must simply never fill up. The count
-     * is the only thing that would ever notice it did, so a server that cannot
-     * give it is refused.
+     * "headroom" names a single node that must never lose a live record. The
+     * count is the only thing that would ever notice it did, so a server that
+     * cannot give it is refused.
      */
     public function test_headroom_is_refused_on_a_server_that_cannot_be_checked(): void
     {
@@ -176,8 +175,8 @@ class EvictionWatchTest extends TestCase
 
     /**
      * A refused token or a dead connection is not an answer about evictions.
-     * Reading it as "this server cannot report" would, under "reject_writes",
-     * quietly switch the check off.
+     * Reading it as "this server cannot report" would, for a watch that does
+     * not require the count, quietly switch the check off.
      */
     public function test_a_failure_to_answer_is_never_read_as_nothing_to_report(): void
     {
@@ -189,5 +188,88 @@ class EvictionWatchTest extends TestCase
         } catch (ServerException $exception) {
             $this->assertTrue($exception->isUnauthorized());
         }
+    }
+
+    /**
+     * Laravel's worker catches the refusal and pops again a moment later. The
+     * check used to stamp its interval before throwing, so the very next call
+     * - inside the interval - went through, and the worker took jobs from a
+     * node that had evicted. A refusal for evictions now stands.
+     */
+    public function test_a_refusal_for_evictions_stands_for_every_later_operation(): void
+    {
+        $store = new ArrayKvClient;
+        $store->simulateLiveEvictions(5);
+        $queue = $this->queue($store, every: 60);
+
+        foreach (['push', 'push again', 'pop', 'push after the interval'] as $attempt) {
+            if ($attempt === 'push after the interval') {
+                Carbon::setTestNow(Carbon::now()->addMinutes(5));
+            }
+
+            try {
+                $attempt === 'pop' ? $queue->pop() : $queue->pushRaw('{"id":"a"}');
+                $this->fail("the {$attempt} went through on a node that had evicted live records");
+            } catch (UnsafeQueueStore $exception) {
+                $this->assertStringContainsString('evicted 5 live record', $exception->getMessage());
+            }
+        }
+
+        $this->assertSame([], array_keys($store->all()), 'something was written after a refusal');
+    }
+
+    /**
+     * The same one-shot hole, for a server that cannot report the count at
+     * all: it was remembered as "unsupported" before the refusal was thrown,
+     * and every later check returned early.
+     */
+    public function test_headroom_on_a_server_that_cannot_be_checked_is_refused_every_time(): void
+    {
+        $store = new ArrayKvClient;
+        $queue = $this->queue(self::olderServer($store), required: true);
+
+        foreach ([1, 2, 3] as $attempt) {
+            try {
+                $queue->pushRaw('{"id":"a"}');
+                $this->fail("push {$attempt} went through without the count headroom requires");
+            } catch (UnsafeQueueStore) {
+            }
+        }
+
+        $this->assertSame([], array_keys($store->all()));
+    }
+
+    /**
+     * Not being able to read the count is asked again on the next operation,
+     * not remembered: one failed answer must not refuse a worker for good.
+     */
+    public function test_a_count_that_could_not_be_read_once_is_read_again_next_time(): void
+    {
+        $store = new ArrayKvClient;
+        $flaky = new class($store) extends InterleavingClient implements ReportsKvMetrics
+        {
+            public int $calls = 0;
+
+            public function kvMetrics(): KvMetrics
+            {
+                if (++$this->calls === 1) {
+                    throw new ServerException(Status::ERROR, 'internal error', '__kv_metrics__');
+                }
+
+                return $this->inner->kvMetrics();
+            }
+        };
+        $queue = $this->queue($flaky, required: true);
+
+        try {
+            $queue->pushRaw('{"id":"a"}');
+            $this->fail('headroom ran without the count');
+        } catch (UnsafeQueueStore) {
+        }
+
+        $queue->pushRaw('{"id":"b"}');
+
+        $this->assertSame(2, $flaky->calls);
+        $this->assertSame(1, $queue->size());
     }
 }

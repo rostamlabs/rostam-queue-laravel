@@ -53,6 +53,19 @@ class InterleavingClient implements KvClient
     }
 
     /**
+     * Hooks that never ran, as "op on key" - for a test to assert there are
+     * none. A hook that never fired opened no window, and the test around it
+     * proved nothing: that is how a race test once passed against a cursor
+     * with no compare in it.
+     *
+     * @return list<string>
+     */
+    public function pendingHooks(): array
+    {
+        return array_values(array_map(static fn (array $hook) => $hook[0].' on '.$hook[1], $this->hooks));
+    }
+
+    /**
      * A worker process that dies at this point: nothing after it in the
      * calling code runs.
      */

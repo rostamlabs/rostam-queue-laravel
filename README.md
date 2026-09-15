@@ -21,44 +21,60 @@ down forever.
 than that and the queue assumes you died. Set it too low and work runs twice; set it
 too high and a genuinely dead worker's job waits that long to come back.
 
-### A node that evicts loses jobs — and a single node always evicts
+### The server has to keep every record — and by default it does not
 
-At capacity a Rostam node either **evicts** records or **refuses** the write, and
-which one is decided by topology, not by any flag:
+A queue is only as durable as the node never throwing away a record it still holds.
+A single-node `rostam-server` throws them away in two ways, both measured:
 
-- a single-node `rostam-server` **always evicts**, silently — every write still
-  answers success — and nothing in its flags or config changes that;
-- only replicated shards (`-cluster`) refuse writes instead.
+- **At capacity**, silently — every write still answers success. On v0.7.0-beta6
+  with a 256 MiB budget, 400 one-megabyte writes all succeeded and **235 read
+  back**.
+- **With room to spare**, by default. Eviction follows write order: a record that
+  sits still while newer writes churn past it is evicted when the buffer wraps,
+  however little else is live. On v0.7.0-beta7 with a 32 MiB budget, put-then-delete
+  churn of ten times the budget **evicted both of two small keys** that were never
+  touched again, with nothing else on the server. A queue is churn, and a delayed
+  job, or a backlog nobody is working, is exactly a record that sits still.
 
-Measured on v0.7.0-beta6, a single node with a 256 MiB budget: 400 one-megabyte
-writes all succeeded, **235 read back**, and the node's own counter said 165 live
-records had been evicted. For a cache that is a miss rate. For a queue it is work
-that was accepted and never done.
-
-Which setup a server is cannot be read off the wire, so the connection declares it,
-and the driver refuses to start without the declaration:
+Started with **`-relocating-eviction`**, the server rescues live records from the
+pages it evicts. The same churn left both keys in place, and a first-in-first-out
+backlog churned eight times over held with **no live evictions at a quarter of the
+budget** — while at half it evicted 1,714 live records along the way. So:
 
 ```php
-'at_cap_policy' => 'reject_writes',   // a -cluster: at capacity, pushes fail loudly
-'at_cap_policy' => 'headroom',        // a single node whose max_memory stays well above the backlog
+'at_cap_policy' => 'headroom',
 ```
 
-What **can** be read — on rostam **v0.7.0-beta3 and newer** — is whether a node has
-already evicted live records (`rostam_kv_evictions_live_total`). The driver reads it
-before the first job is accepted or taken, and again every `verify_every` seconds,
-and **refuses to run on a node that has evicted any**. Be clear about what that is:
+declares the one setup this driver runs on, and the connector refuses to start
+without it:
 
-- it **catches a false declaration**, it never proves a true one — zero before a
-  node ever fills up says nothing about the day it does;
-- it is **node-wide**: evictions of anyone's keys on that node count, not only jobs,
-  which is right, because on a node declared never to evict, any eviction
-  contradicts the declaration;
+- **a single `rostam-server` started with `-relocating-eviction`**;
+- **`max_memory` well above everything live on it** — the backlog at its worst, the
+  delayed jobs, and anything else sharing the server (a quarter held in the
+  measurement above; half did not);
+- **rostam v0.7.0-beta3 or newer.**
+
+The first two cannot be read off the wire — that part is your declaration. What
+**can** be read is whether the node has already evicted live records
+(`rostam_kv_evictions_live_total`). The driver reads it before the first job is
+accepted or taken and again every `verify_every` seconds, and **refuses to run on a
+node that has evicted any**. Be clear about what that is:
+
+- it **catches a node that is losing records**, it never proves one will not;
+- it is **node-wide**: evictions of anyone's keys count, not only jobs;
+- once it has refused, **that worker stays refused until it is restarted** — the
+  count cannot go back down, and a worker that caught the exception and popped again
+  a moment later must not find the door open;
+- a server that cannot report the count is refused on every operation;
 - the count **resets when the server restarts**, and restarting to clear it does not
   bring back what was lost.
 
-`headroom` has nothing else standing between a full node and silent loss, so it is
-**refused on a server that cannot report the count**. `reject_writes` runs on the
-declaration alone against an older server, because there the node itself refuses.
+### A replicated cluster is not supported
+
+A `-cluster` refuses writes at capacity instead of evicting, which is what a queue
+wants — but it answers a read from whichever replica received it, and this driver
+reads a job's absence as that job being finished. A lagging replica would drop a
+job. `'at_cap_policy' => 'reject_writes'` is refused with that explanation.
 
 ### Nothing may flush the server
 
@@ -88,9 +104,13 @@ fewer shards or more memory.
 
 - PHP 8.2+
 - Laravel 12 or 13
-- **Rostam v0.5.0 or newer**, started with a `-tcp` listener
-- **Rostam v0.7.0-beta3 or newer** for eviction checks — required for `headroom`
+- **Rostam v0.7.0-beta3 or newer**, a single node, started with a `-tcp` listener
+  and `-relocating-eviction`
 - `rostamlabs/rostam-client-php` ^0.3
+
+```bash
+rostam-server -tcp 127.0.0.1:7000 -relocating-eviction -config rostam.json
+```
 
 ## Install
 
@@ -106,9 +126,11 @@ composer require rostamlabs/rostam-queue-laravel
     'connection'    => 'default',     // an entry under rostam.connections
     'queue'         => 'default',
     'retry_after'   => 90,            // the lease; longer than your longest job
-    'at_cap_policy' => 'headroom',    // or 'reject_writes' — see above; required
+    'at_cap_policy' => 'headroom',    // required - see above
+    'after_commit'  => false,         // Laravel's own option
     'verify_every'  => 60,            // seconds between eviction checks
     'sweep_seconds' => 60,            // delayed seconds one pop may move
+    'reclaim_batch' => 32,            // ids one pop checks for jobs whose worker died
     'tombstone_ttl' => 604800,        // how long a killed slot stays killed
 ],
 ```
@@ -116,6 +138,9 @@ composer require rostamlabs/rostam-queue-laravel
 The server itself is described once, under `rostam.connections`, shared with
 [`rostamlabs/rostam-cache-laravel`](https://github.com/rostamlabs/rostam-cache-laravel)
 if you use it. A `host`/`port` given inline here wins over that.
+
+`php artisan queue:clear rostam` works, and queue names may be backed enums or
+forwarded with Laravel's queue routes.
 
 ## How it works
 
@@ -127,11 +152,13 @@ space with server-side counters:
 {prefix}{queue}:head                the next id to read
 {prefix}{queue}:job:{id}            the payload (no TTL), or a tombstone
 {prefix}{queue}:lease:{id}          who holds it, with a TTL the engine expires
-{prefix}{queue}:reclaim             how far redelivery has swept
-{prefix}{queue}:d:{second}:tail     ids handed out for a delayed second; sealed once swept
+{prefix}{queue}:reclaim             how far redelivery has settled
+{prefix}{queue}:d:{second}:tail     ids handed out for a delayed second, sealed while it is swept
 {prefix}{queue}:d:{second}:job:{id} a delayed job, or a tombstone
+{prefix}{queue}:mig:{second}:{id}   the lease on moving one delayed job
 {prefix}{queue}:swept               the last delayed second fully moved
-{prefix}{queue}:delayed             a gauge of delayed jobs waiting
+{prefix}{queue}:dgen                the delayed generation, moved on by clear()
+{prefix}{queue}:delayed:{gen}       a gauge of delayed jobs waiting in that generation
 ```
 
 **Claiming takes a lease, not the job.** The payload stays put for as long as a
@@ -145,12 +172,13 @@ worker holds it, so a worker that dies does not take the work with it:
 
 The middle row is what every other driver needs a reservation index for, and finding
 expired reservations normally needs a scan this engine does not have. It does not
-need one: **the ids are dense, so walking them is the index.**
+need one: **the ids are dense, so walking them is the index.** Each pop reads a
+window of `reclaim_batch` ids in two round trips and looks past jobs still running,
+so one long job does not hold back the redelivery of abandoned ones above it.
 
 **Every step that decides something is one atomic op.** Each job this driver has
 ever lost was lost in the gap between two round trips, and each gap is closed by
-deciding with a single op rather than checking and then acting — a check always
-leaves a window between reading and acting.
+deciding with a single op rather than checking and then acting.
 
 - **A push draws its id, then writes its payload.** A worker reaching that slot in
   between finds it empty. It does not step over it: it kills the slot with `set_nx`
@@ -159,35 +187,47 @@ leaves a window between reading and acting.
 - **The reader advances by compare-and-swap, never by increment.** Two workers
   examining one slot would otherwise both advance, and the next job would be stepped
   over without being handed to anyone.
-- **Redelivery is claimed with the job's own lease** before the job is put back, so
-  two workers passing one abandoned job do not both requeue it — and the copy is
-  written before the original is removed, so a worker dying in between leaves two,
-  never none.
+- **Redelivery is claimed with the job's own lease**, and the job is read again
+  under it — its worker may have finished late. The copy is written before the
+  original is removed, so a worker dying in between leaves two, never none.
 - **`release()` writes the retry before finishing the original**, for the same
   reason.
+- **`clear()` overwrites each waiting slot with a tombstone** instead of deleting
+  it, so a push that drew one of those ids finds it killed and lands after the
+  clear, where it is delivered.
 
 **Delayed jobs wait in per-second buckets**, and each `pop` moves the seconds that
-have come due — a handful of keys in steady state, instead of the sorted set this
-engine does not have. The same rules apply there:
+have come due. The same rules apply there:
 
-- a second's id counter is **sealed** as the sweep passes it, and a push that draws
-  a sealed id — or finds its slot killed — sends its job to the ready queue instead;
+- the sweep **seals** a second's id counter before counting it, so a push drawing an
+  id meanwhile carries the seal and sends its job to the ready queue;
 - a job due in the past goes straight to the ready queue;
-- a delayed job is **copied, then deleted**, under a per-job lease, and a second is
-  marked done only once every job in it has moved.
+- a push that stored its job **checks the watermark afterwards**, and if the sweep
+  has passed its second, moves the job itself — so no pause of a producer, however
+  long, strands a delayed job;
+- a delayed job is **copied, then deleted**, under a per-job move lease, and read
+  again under it; a second is marked done only once every job in it has moved, and
+  its counter is deleted then;
+- `clear()` moves the **delayed generation** on: a job stored under an older one is
+  deleted instead of delivered when its second comes, and the generation is read
+  under the move lease, so a job delayed after a clear is never taken for one it
+  cleared.
 
 A queue idle for a long time catches up over several pops rather than sweeping a day
 of seconds in one.
 
 ### The limits this does not cover
 
-- **A push paused longer than `tombstone_ttl`** (a week by default) between drawing
-  its id and writing its payload can land in a slot whose tombstone has expired, behind
-  every cursor. A tombstone that never expired would keep every killed slot in memory
-  for ever; this is the trade.
+- **A ready push paused longer than `tombstone_ttl`** (a week by default) between
+  drawing its id and writing its payload can land in a slot whose tombstone has
+  expired, behind every cursor. A tombstone that never expired would keep every
+  killed slot in memory forever; this is the trade.
 - **The server losing records** — eviction or a flush. See above.
 - **Duplicates.** A crash between writing a copy and removing an original leaves
   both, and a slow worker's job may be redelivered. At-least-once allows both.
+- **A job enqueued while `clear()` is running** may land on either side of it.
+- **Keys left by a crash.** A worker killed between marking a delayed second done
+  and deleting its counter leaves that one small key behind.
 
 ## Monitoring
 
@@ -197,11 +237,12 @@ $queue->pendingSize();        // between the reader and the writer — an upper 
 $queue->delayedSize();        // delayed jobs waiting, however far out
 $queue->reservedSize();       // always 0 — see below
 $queue->redeliveredCount();   // jobs this instance handed back after a worker died
-$queue->holesSeen();          // empty slots this instance killed
+$queue->holesSeen();          // empty slots this instance killed and moved past
 ```
 
-`pendingSize()` counts every id between the reader and the writer, so jobs being
-worked on and killed slots the reader has not yet passed are in it.
+`pendingSize()` counts the ids between the reader and the writer: waiting jobs, plus
+killed slots the reader has not yet passed. Jobs being worked on are not in it — the
+reader has passed them.
 
 `delayedSize()` is a gauge kept beside the buckets, since the buckets cannot be
 enumerated; a worker killed between storing a delayed job and counting it leaves it
@@ -209,7 +250,9 @@ off by one.
 
 `holesSeen()` counts empty slots this instance killed and moved past. A push caught
 mid-write leaves one and re-routes itself, so a steady trickle is normal. A **run**
-of them in a single pop throws `JobVanished`: that is records written and then gone.
+of 64 in a single pop throws `JobVanished`: that is records written and then gone.
+Losing races to other workers never counts; a pop that loses every race returns
+nothing, and the worker polls again.
 
 `reservedSize()` is always zero, and that is a statement rather than a stub. A
 reserved job is one a worker holds but has not finished; the only record of that is a
@@ -225,14 +268,13 @@ composer test
 
 Every race this driver has lost jobs to has a test that drives that exact
 interleaving — a push caught between its id and its payload, a worker killed while
-moving a delayed job, a sweep that finished a second before a push drew its id —
-through a client that can stop the world between any two round trips. Each was
-written red against the code that had the race, and each fix is checked by
-reverting it.
+moving a delayed job, a clear finishing under a sweep — through a client that can
+stop the world between any two round trips. Each of those tests fails if its hook
+never fires, and each fix is checked by reverting it and watching a test go red.
 
 Against a real server, a chaos test runs producers and workers as separate
 processes and kills workers at random instants, then asserts that every job a
-producer saw accepted was delivered:
+producer saw accepted was **finished** by a worker — not merely handed out:
 
 ```bash
 ROSTAM_TEST_SERVER=127.0.0.1:7000 vendor/bin/phpunit tests/Chaos/ChaosTest.php

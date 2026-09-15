@@ -17,31 +17,38 @@ use Rostam\Queue\RostamQueue;
 /**
  * Builds the queue, and refuses to build one that could eat jobs.
  *
- * A queue on Rostam is only as durable as the node never throwing records away.
- * At capacity a node either evicts or refuses the write, and which one it does
- * is decided by topology rather than by any flag: a single-node `rostam-server`
- * always evicts - silently, every write still answering success - and only
- * replicated shards refuse. Measured on v0.7.0-beta6: with a 256 MiB budget,
- * 400 one-megabyte writes all succeeded and 235 read back.
+ * A queue on Rostam is only as durable as the node never throwing away a record
+ * it still holds, and a single-node `rostam-server` does exactly that under two
+ * conditions, both measured:
  *
- * Which setup a server is cannot be read off the wire, so the operator says:
+ * - at capacity, silently, every write still answering success (v0.7.0-beta6,
+ *   256 MiB: 400 one-megabyte writes accepted, 235 readable);
+ * - with plenty of room, by default: eviction is write-ordered, so a record that
+ *   sits still while newer writes churn past it is evicted when the ring wraps.
+ *   A queue churns by nature. On v0.7.0-beta7 with 32 MiB, put/delete churn of
+ *   ten times the budget evicted two small keys that were never touched again,
+ *   with nothing else live. `-relocating-eviction` rescued them.
  *
- *     'at_cap_policy' => 'reject_writes'   // a -cluster: at capacity, pushes fail
- *     'at_cap_policy' => 'headroom'        // a single node sized never to fill up
+ * So the connection declares the one setup that holds, which cannot be read off
+ * the wire:
+ *
+ *     'at_cap_policy' => 'headroom'   // one node, -relocating-eviction, live data well under max_memory
  *
  * What CAN be read, on rostam v0.7.0-beta3 and newer, is whether a node has
  * already evicted live records. {@see EvictionWatch} checks that before the
- * first job is accepted or taken, and again as the queue runs; "headroom" is
- * refused on a server too old to be checked, since nothing else would stand
- * between a full single node and silent loss.
+ * first job is accepted or taken, and again as the queue runs, and a server too
+ * old to be checked is refused.
+ *
+ * "reject_writes" - a replicated `-cluster`, which refuses at capacity instead
+ * of evicting - is refused too, for a different reason: a cluster answers a read
+ * from whichever replica received it, and this driver reads a job's absence as
+ * that job being finished. A lagging replica's answer would drop a job.
  *
  * Nothing here touches the network. The first queue operation does, and it
  * checks before it touches a job.
  */
 class RostamConnector implements ConnectorInterface
 {
-    private const DECLARATIONS = ['reject_writes', 'headroom'];
-
     public function __construct(private readonly ?Config $config = null) {}
 
     /**
@@ -49,7 +56,7 @@ class RostamConnector implements ConnectorInterface
      */
     public function connect(array $config): QueueContract
     {
-        $declared = $this->declaration($config);
+        $this->declaration($config);
         $client = TcpClient::fromArray($this->connection($config));
 
         return new RostamQueue(
@@ -58,12 +65,14 @@ class RostamConnector implements ConnectorInterface
             default: (string) ($config['queue'] ?? 'default'),
             retryAfter: (int) ($config['retry_after'] ?? 90),
             sweepSeconds: (int) ($config['sweep_seconds'] ?? 60),
+            reclaimBatch: (int) ($config['reclaim_batch'] ?? 32),
             tombstoneTtl: (int) ($config['tombstone_ttl'] ?? 604800),
             watch: new EvictionWatch(
                 $client,
-                required: $declared === 'headroom',
+                required: true,
                 everySeconds: (int) ($config['verify_every'] ?? 60),
             ),
+            dispatchAfterCommit: isset($config['after_commit']) ? (bool) $config['after_commit'] : null,
         );
     }
 
@@ -94,12 +103,16 @@ class RostamConnector implements ConnectorInterface
     /**
      * @param  array<string, mixed>  $config
      */
-    protected function declaration(array $config): string
+    protected function declaration(array $config): void
     {
         $declared = $config['at_cap_policy'] ?? null;
 
-        if (in_array($declared, self::DECLARATIONS, true)) {
-            return $declared;
+        if ($declared === 'headroom') {
+            return;
+        }
+
+        if ($declared === 'reject_writes') {
+            throw UnsafeQueueStore::clusterUnsupported();
         }
 
         throw UnsafeQueueStore::policyNotDeclared(is_string($declared) ? $declared : null);

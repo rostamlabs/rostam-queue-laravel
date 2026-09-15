@@ -25,11 +25,15 @@ use Rostam\Queue\RostamQueue;
  * lapse and a last worker drains what is left.
  *
  * The assertion is the queue's promise and nothing weaker: every job a producer
- * saw accepted was handed to a worker at least once, and nothing is left behind.
- * Duplicates are counted and reported, not failed - at-least-once allows them.
+ * saw accepted was FINISHED - deleted by a worker that handled it - at least
+ * once, and nothing is left behind. Taken is not enough: a job handed out and
+ * then dropped by a release or a redelivery that lost it would pass a check
+ * that only asks whether it was ever handed out. Duplicates are counted and
+ * reported, not failed - at-least-once allows them.
  *
- * It needs a real server (ROSTAM_TEST_SERVER) and takes about a minute, so it
- * runs in its own group: `vendor/bin/phpunit --group chaos`.
+ * It needs a real server (ROSTAM_TEST_SERVER) and takes about half a minute.
+ * It is outside the default suites, so name the file:
+ * `vendor/bin/phpunit tests/Chaos/ChaosTest.php`.
  */
 #[Group('chaos')]
 class ChaosTest extends TestCase
@@ -154,7 +158,7 @@ class ChaosTest extends TestCase
             $producing = array_filter($producers, static fn ($p) => proc_get_status($p[0])['running']);
             $produced = array_unique($this->logged('produced'));
 
-            if ($producing === [] && count(array_diff($produced, $this->logged('taken'))) === 0) {
+            if ($producing === [] && $this->neverHandled($target, $prefix, $produced) === []) {
                 break;
             }
         }
@@ -181,20 +185,21 @@ class ChaosTest extends TestCase
         $drained = [];
         for ($round = 0; $round < 5; $round++) {
             while ($job = $final->pop()) {
-                $drained[] = json_decode($job->getRawBody(), true)['id'];
+                $id = json_decode($job->getRawBody(), true)['id'];
+                $final->getClient()->put($prefix.'handled:'.$id, '1');
                 $job->delete();
+                $drained[] = $id;
             }
             sleep(3);
         }
 
         $produced = array_unique($this->logged('produced'));
         $taken = array_merge($this->logged('taken'), $drained);
-        $missing = array_values(array_diff($produced, $taken));
-        $duplicates = count($taken) - count(array_unique($taken));
+        $missing = $this->neverHandled($target, $prefix, $produced);
 
         fwrite(STDERR, sprintf(
-            "[chaos] produced %d, deliveries %d (%d duplicate), workers killed %d, drained at the end %d, missing %d\n",
-            count($produced), count($taken), $duplicates, $kills, count($drained), count($missing),
+            "[chaos] produced %d, handed out %d (%d more than once), workers killed %d, drained at the end %d, never handled %d\n",
+            count($produced), count($taken), count($taken) - count(array_unique($taken)), $kills, count($drained), count($missing),
         ));
 
         // A child's own failure - a fatal, a refused connection - lands in its
@@ -202,8 +207,103 @@ class ChaosTest extends TestCase
         $childErrors = trim((string) @file_get_contents($this->dir.'/stderr.log'));
         $context = $childErrors === '' ? '' : "\nchild stderr:\n".substr($childErrors, -2000);
 
+        if ($missing !== []) {
+            $context .= "\n".$this->whereTheJobsAre($target, $prefix, $missing);
+        }
+
         $this->assertSame(self::PRODUCERS * self::JOBS_PER_PRODUCER, count($produced), 'a producer did not finish'.$context);
-        $this->assertSame([], $missing, 'accepted jobs were never delivered'.$context);
+        $this->assertSame([], $missing, 'accepted jobs were never handled'.$context);
         $this->assertNull($final->pop(), 'jobs were still waiting after the final drain'.$context);
+    }
+
+    /**
+     * The produced jobs no worker has marked handled.
+     *
+     * The mark is written to the store by the worker holding the job, before it
+     * deletes it, so it survives that worker being killed a moment later - which
+     * a line appended to a log file does not.
+     *
+     * @param  list<string>  $produced
+     * @return list<string>
+     */
+    private function neverHandled(string $target, string $prefix, array $produced): array
+    {
+        [$host, $port] = explode(':', $target);
+        $client = TcpClient::fromArray(['host' => $host, 'port' => (int) $port]);
+        $missing = [];
+
+        foreach (array_chunk($produced, 200) as $chunk) {
+            $keys = array_map(static fn (string $id) => $prefix.'handled:'.$id, $chunk);
+
+            foreach ($client->getMany($keys) as $key => $value) {
+                if ($value === null) {
+                    $missing[] = substr($key, strlen($prefix.'handled:'));
+                }
+            }
+        }
+
+        return $missing;
+    }
+
+    /**
+     * Where a job that was never finished actually is, for a failure that has
+     * to be diagnosed rather than re-run: the cursors, and every key still
+     * holding one of the missing payloads.
+     *
+     * @param  list<string>  $missing
+     */
+    private function whereTheJobsAre(string $target, string $prefix, array $missing): string
+    {
+        [$host, $port] = explode(':', $target);
+        $client = TcpClient::fromArray(['host' => $host, 'port' => (int) $port]);
+
+        $counter = static function (string $key) use ($client): int {
+            $raw = $client->get($key);
+
+            return ($raw !== null && strlen($raw) === 8) ? unpack('J', $raw)[1] : 0;
+        };
+
+        $head = $counter($prefix.'default:head');
+        $tail = $counter($prefix.'default:tail');
+        $swept = $counter($prefix.'default:swept');
+        $report = [sprintf(
+            'head=%d tail=%d reclaim=%d swept=%d (now %d) dgen=%d missing=%s',
+            $head, $tail, $counter($prefix.'default:reclaim'), $swept, time(),
+            $counter($prefix.'default:dgen'), implode(',', $missing),
+        )];
+
+        // Every ready slot, and every delayed bucket from two minutes before the
+        // watermark to a little after now: a job that is still somewhere is in
+        // one of them, and one that is in none of them is gone from the store.
+        $keys = [];
+
+        for ($id = 1; $id <= $tail; $id++) {
+            $keys[] = $prefix.'default:job:'.$id;
+        }
+
+        for ($second = $swept - 120; $second <= time() + 5; $second++) {
+            $ids = $counter($prefix.'default:d:'.$second.':tail') & ~RostamQueue::SEALED;
+
+            for ($id = 1; $id <= $ids; $id++) {
+                $keys[] = $prefix.'default:d:'.$second.':job:'.$id;
+            }
+        }
+
+        foreach (array_chunk($keys, 200) as $chunk) {
+            foreach ($client->getMany($chunk) as $key => $value) {
+                if ($value === null || $value === RostamQueue::TOMBSTONE) {
+                    continue;
+                }
+
+                foreach ($missing as $id) {
+                    if (str_contains($value, '"'.$id.'"')) {
+                        $report[] = $id.' is still at '.$key.' (lease: '
+                            .var_export($client->get(str_replace(':job:', ':lease:', $key)), true).')';
+                    }
+                }
+            }
+        }
+
+        return implode("\n", $report);
     }
 }

@@ -100,6 +100,14 @@ while (! file_exists($stopFile)) {
         continue;
     }
 
+    // The record that this job was handled goes into the STORE, and before the
+    // job is deleted rather than after. A log file cannot carry it: a worker
+    // killed while appending its line loses the record for a job it really did
+    // finish, and the parent cannot tell that from a job the queue dropped.
+    // Here a kill between the mark and the delete leaves the job to be
+    // redelivered and handled again, which is what at-least-once allows.
+    $queue->getClient()->put($prefix.'handled:'.$id, '1');
+
     $job->delete();
 }
 
