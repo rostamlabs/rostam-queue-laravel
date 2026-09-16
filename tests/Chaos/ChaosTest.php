@@ -199,7 +199,8 @@ class ChaosTest extends TestCase
         $produced = array_unique($this->logged('produced'));
         $taken = array_merge($this->logged('taken'), $drained);
         $missing = $this->neverHandled($target, $prefix, $produced);
-        $evicted = $this->evictionsLive($target) - $evictedBefore;
+        $evictedNow = $this->evictionsLive($target);
+        $evicted = ($evictedNow ?? 0) - ($evictedBefore ?? 0);
 
         fwrite(STDERR, sprintf(
             "[chaos] produced %d, handed out %d (%d more than once), workers killed %d, drained at the end %d, never handled %d\n",
@@ -224,6 +225,14 @@ class ChaosTest extends TestCase
         }
 
         if ($missing !== []) {
+            // On a server too old to count evictions there is no way to tell the
+            // engine's loss from the queue's, and saying nothing would let this
+            // read as the queue's every time.
+            if ($evictedNow === null) {
+                $context .= "\nthis server cannot report evictions (rostam_kv_evictions_live_total arrived in "
+                    .'v0.7.0-beta3), so a loss here may be the engine throwing records away rather than the queue.';
+            }
+
             $context .= "\n".$this->whereTheJobsAre($target, $prefix, $missing);
         }
 
@@ -233,17 +242,19 @@ class ChaosTest extends TestCase
     }
 
     /**
-     * Live records the node says it has thrown away, or 0 from a server too old
-     * to count them - where a run simply cannot tell the two apart.
+     * Live records the node says it has thrown away, or null from a server too
+     * old to count them - where a run cannot tell the engine's loss from the
+     * queue's, and has to say so rather than pick one.
      */
-    private function evictionsLive(string $target): int
+    private function evictionsLive(string $target): ?int
     {
         [$host, $port] = explode(':', $target);
 
         try {
-            return TcpClient::fromArray(['host' => $host, 'port' => (int) $port])->kvMetrics()->evictionsLive() ?? 0;
+            return TcpClient::fromArray(['host' => $host, 'port' => (int) $port])->kvMetrics()->evictionsLive();
         } catch (ServerException) {
-            return 0;
+            // The generic error, which is what a server without the op answers.
+            return null;
         }
     }
 

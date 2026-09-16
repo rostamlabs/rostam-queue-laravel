@@ -568,7 +568,8 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      *
      * A job a worker is running when the queue is cleared finishes normally: it
      * holds the payload already, and the tombstone only stops the slot being
-     * handed out again. A job whose worker died is cleared like any other.
+     * handed out again - so it is counted as removed and then completes anyway.
+     * A job whose worker died is cleared like any other.
      *
      * @param  \UnitEnum|string|null  $queue
      */
@@ -588,13 +589,20 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
             $keys = [];
 
             for ($slot = $id; $slot <= min($id + self::CLEAR_BATCH - 1, $at); $slot++) {
-                $keys[] = $this->jobKey($queue, $slot);
+                $keys[$slot] = $this->jobKey($queue, $slot);
             }
 
             $kill = [];
-            $slot = $id;
 
-            foreach ($this->client->getMany($keys) as $key => $payload) {
+            // Keyed by slot, not walked beside the answer: a client that
+            // answered in another order, or dropped an entry, would otherwise
+            // put a slot on the wrong side of the reader - and the wrong side
+            // is a job left where a push can bury it.
+            $payloads = $this->client->getMany(array_values($keys));
+
+            foreach ($keys as $slot => $key) {
+                $payload = $payloads[$key] ?? null;
+
                 if ($payload !== null && $payload !== self::TOMBSTONE) {
                     $removed++;
                 }
@@ -610,8 +618,6 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
                 if ($slot > $reader || $payload !== null) {
                     $kill[] = [$key, self::TOMBSTONE, $this->tombstoneTtl];
                 }
-
-                $slot++;
             }
 
             if ($kill !== []) {

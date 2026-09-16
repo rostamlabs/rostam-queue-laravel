@@ -867,6 +867,58 @@ class JobLossRacesTest extends TestCase
     }
 
     /**
+     * One clear, with work to kill on BOTH sides of the reader: an abandoned
+     * payload below it, and an id drawn but not yet written above it. Every
+     * other clear test has the reader at one end of the walk, so a single wrong
+     * condition - kill only above, kill only what was read, classify the whole
+     * batch by its first slot - still passes them all.
+     */
+    public function test_one_clear_kills_on_both_sides_of_the_reader(): void
+    {
+        $operator = $this->worker('operator');
+        $operator->pushRaw(self::job('worker-died-holding-it'));
+
+        $this->worker('dies')->pop();
+        $this->everyWorkerIsGone();                 // slot 1: payload, no lease, below the reader
+
+        $drawn = $this->store->increment('q:default:tail');   // slot 2: drawn, never written
+
+        $this->assertSame(1, $operator->clear(), 'only the abandoned job was there to count');
+
+        $this->assertSame(
+            RostamQueue::TOMBSTONE,
+            $this->store->get('q:default:job:1'),
+            'the dead worker\'s payload is still in the store'
+        );
+        $this->assertSame(
+            RostamQueue::TOMBSTONE,
+            $this->store->get('q:default:job:'.$drawn),
+            'the slot an unwritten push had drawn was left alive'
+        );
+
+        // And that push, arriving late, finds its slot taken and re-routes.
+        $this->assertFalse($this->store->setNx('q:default:job:'.$drawn, self::job('straggler')));
+        $this->assertSame([], $this->drain($this->worker('healthy')), 'a cleared job came back');
+    }
+
+    /**
+     * A killed slot is not a job. `queue:clear` prints what it removed, and
+     * counting the tombstones a worker left behind would inflate that by every
+     * push that was ever caught mid-write.
+     */
+    public function test_clearing_does_not_count_slots_that_were_already_killed(): void
+    {
+        $queue = $this->worker('operator');
+        $queue->pushRaw(self::job('real'));
+        $queue->pushRaw(self::job('also-real'));
+
+        // A slot a worker killed while its push re-routed.
+        $this->store->put('q:default:job:2', RostamQueue::TOMBSTONE);
+
+        $this->assertSame(1, $queue->clear(), 'a tombstone was counted as a job');
+    }
+
+    /**
      * The gauge of a generation nobody can reach any more goes with the clear
      * that abandoned it, rather than sitting there for ever.
      */

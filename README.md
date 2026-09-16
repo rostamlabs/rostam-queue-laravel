@@ -105,15 +105,17 @@ these keys.
 ### How large a job can be
 
 A job's payload is one value, and an entry has to fit in one page of the server's
-cache — where the page bounds **the key and the value together**. On a default
-single-node server `strlen($key) + strlen($value)` reached **1,048,550 bytes on
-v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**, constant across key lengths;
-the key here is the queue's own (`{prefix}{queue}:job:{id}`), so nearly all of it
-is yours. It is a constant per deployment rather than a share of `max_memory`: a
-one-shard server measured **2,097,106** with a 32 MiB budget, and a 512 MiB server
-still measured 1,048,546 — fewer shards, bigger pages. A larger job fails at
-`push` with the server's generic `internal error`. Keep payloads small — pass ids,
-not models — or give the server fewer shards.
+cache — where the page bounds **the key and the value together**. The page follows
+the PER-SHARD budget: `floorPow2(max_memory / shards / 16)`, clamped to 1 MiB…1 GiB.
+On a default server that is the 1 MiB floor, and `strlen($key) + strlen($value)`
+reached **1,048,550 bytes on v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**,
+constant across key lengths; the key here is the queue's own
+(`{prefix}{queue}:job:{id}`), so nearly all of it is yours. Measured at other
+geometries on beta7: 2,097,122 at 32 MiB on one shard, 4,194,274 at 256 MiB on
+four, 8,388,578 at 128 MiB on one — about 30 bytes under the page each time. Most
+deployments sit on the floor, so halving the shard count raises the limit where
+raising `max_memory` alone does not. A larger job fails at `push` with the server's
+generic `internal error`. Keep payloads small — pass ids, not models.
 
 ## Requirements
 
@@ -261,7 +263,10 @@ of seconds in one.
 - **A ready push paused longer than `tombstone_ttl`** (a week by default) between
   drawing its id and writing its payload can land in a slot whose tombstone has
   expired, behind every cursor. A tombstone that never expired would keep every
-  killed slot in memory forever; this is the trade.
+  killed slot in memory forever; this is the trade, and `tombstone_ttl => 0` takes
+  the other side of it. A `clear()` passing over such a slot does not re-arm it:
+  below the reader it kills only slots that hold something, which is what stops
+  clearing an empty queue from writing a key per id.
 - **The server losing records** — eviction or a flush. See above.
 - **Duplicates.** A crash between writing a copy and removing an original leaves
   both, and a slow worker's job may be redelivered. At-least-once allows both.
