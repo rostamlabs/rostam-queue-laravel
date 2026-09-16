@@ -112,7 +112,8 @@ reached **1,048,550 bytes on v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7*
 constant across key lengths; the key here is the queue's own
 (`{prefix}{queue}:job:{id}`), so nearly all of it is yours. Measured at other
 geometries on beta7: 2,097,122 at 32 MiB on one shard, 4,194,274 at 256 MiB on
-four, 8,388,578 at 128 MiB on one — about 30 bytes under the page each time. Most
+four, 8,388,578 at 128 MiB on one — 30 bytes under the page each time on an
+in-memory shard, and 16 bytes less again on a persistent one (`-data`). Most
 deployments sit on the floor, so halving the shard count raises the limit where
 raising `max_memory` alone does not. A larger job fails at `push` with the server's
 generic `internal error`. Keep payloads small — pass ids, not models.
