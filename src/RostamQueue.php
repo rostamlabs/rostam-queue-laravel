@@ -263,7 +263,9 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      *
      * The id it returns is the delayed bucket's, not the ready queue's - a
      * different id space from pushRaw()'s, and meaningful only inside the
-     * second the job is due. Laravel ignores it.
+     * second the job is due. Except when the job goes to the ready queue after
+     * all (every branch below), where it is a ready-queue id. Laravel ignores
+     * it either way.
      *
      * @param  \DateTimeInterface|\DateInterval|int  $delay
      */
@@ -305,12 +307,22 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         // queue and the bucket copy is dropped. If the lease holder is alive and
         // moves it too, that is a duplicate - which at-least-once allows, and
         // losing the job is not.
-        if ($due <= $this->swept($queue) && ! $this->moveDelayed($queue, $due, $id)) {
-            $placed = $this->enqueue($queue, $payload);
-            $this->client->del($this->bucketJobKey($queue, $due, $id));
-            $this->client->increment($this->gaugeKey($queue, $generation), -1, $this->tombstoneTtl);
+        if ($due <= $this->swept($queue)) {
+            $moved = $this->moveDelayed($queue, $due, $id);
 
-            return (string) $placed;
+            // Drawing that id re-created the second's counter, and no sweep will
+            // pass this second again to delete it. Left alone it is a key with
+            // no TTL and nothing to remove it. A producer drawing from it in the
+            // meantime gets a fresh id, stores its job, and lands here too.
+            $this->client->del($this->bucketTailKey($queue, $due));
+
+            if (! $moved) {
+                $placed = $this->enqueue($queue, $payload);
+                $this->client->del($this->bucketJobKey($queue, $due, $id));
+                $this->client->increment($this->gaugeKey($queue, $generation), -1, $this->tombstoneTtl);
+
+                return (string) $placed;
+            }
         }
 
         return (string) $id;
@@ -546,8 +558,13 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      * Delayed jobs cannot be found - their buckets cannot be enumerated - so
      * they are orphaned instead: the delayed generation moves on, and a job
      * stored under an older one is deleted rather than delivered when the sweep
-     * reaches its second. A job enqueued while the clear is running may land on
-     * either side of it.
+     * reaches its second.
+     *
+     * A job enqueued while the clear is running may land on either side of it -
+     * including a copy that redelivery is writing back for a dead worker at that
+     * moment, which lands above the writer this clear read and survives it. The
+     * count is what the clear READ: a payload that lands between the read and
+     * the kill is destroyed with the rest and not counted.
      *
      * A job a worker is running when the queue is cleared finishes normally: it
      * holds the payload already, and the tombstone only stops the slot being
@@ -560,6 +577,7 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         $queue = $this->queueName($queue);
         $at = $this->tail($queue)->value();
         $reclaim = new Cursor($this->client, $this->key($queue, 'reclaim'));
+        $reader = $this->head($queue)->value();
         $removed = 0;
 
         // From the REDELIVERY cursor, not the reader: a job whose worker died is
@@ -573,19 +591,32 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
                 $keys[] = $this->jobKey($queue, $slot);
             }
 
-            // Read, then kill: what was read is what is being reported as
-            // cleared, and the tombstone is what stops a push that has drawn one
-            // of these ids from landing behind the cursors.
-            foreach ($this->client->getMany($keys) as $payload) {
+            $kill = [];
+            $slot = $id;
+
+            foreach ($this->client->getMany($keys) as $key => $payload) {
                 if ($payload !== null && $payload !== self::TOMBSTONE) {
                     $removed++;
                 }
+
+                // Above the reader, every slot is killed whether or not it holds
+                // anything: an id drawn but not yet written is exactly the push
+                // that must not land behind this clear. At or below the reader
+                // no push can arrive - ids come from the writer, which is ahead
+                // of the reader - so a slot that holds nothing there is a job
+                // that finished, and a tombstone on it is a key invented for
+                // nothing. Writing one per id since the redelivery cursor turned
+                // clearing an empty queue into twenty thousand new keys.
+                if ($slot > $reader || $payload !== null) {
+                    $kill[] = [$key, self::TOMBSTONE, $this->tombstoneTtl];
+                }
+
+                $slot++;
             }
 
-            $this->client->putMany(array_map(
-                fn (string $key) => [$key, self::TOMBSTONE, $this->tombstoneTtl],
-                $keys,
-            ));
+            if ($kill !== []) {
+                $this->client->putMany($kill);
+            }
         }
 
         $generation = $this->delayedGeneration($queue);

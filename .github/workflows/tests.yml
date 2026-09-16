@@ -231,7 +231,14 @@ jobs:
       # instants, then every accepted job must have been FINISHED - not merely
       # handed out. The seed is printed, so a failure here can be replayed with
       # CHAOS_SEED.
+      #
+      # --fail-on-skipped, and only here: the test skips itself when the SERVER
+      # evicted during the run, because then it is measuring the engine rather
+      # than the queue - but a skip exits 0, and a gate that passes when the
+      # thing it guards could not be checked is not a gate. The stable lane runs
+      # without -relocating-eviction, so this is a live possibility, not a
+      # hypothetical.
       - name: Kill workers at random and count every job
         env:
           ROSTAM_TEST_SERVER: 127.0.0.1:7411
-        run: vendor/bin/phpunit tests/Chaos/ChaosTest.php
+        run: vendor/bin/phpunit --fail-on-skipped tests/Chaos/ChaosTest.php

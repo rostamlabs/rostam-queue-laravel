@@ -75,7 +75,10 @@ node that has evicted any**. Be clear about what that is:
   a moment later must not find the door open;
 - a server that cannot report the count is refused on every operation;
 - the count **resets when the server restarts**, and restarting to clear it does not
-  bring back what was lost.
+  bring back what was lost;
+- all of that is what `on_evictions => 'refuse'` means, and it is the default;
+  `'ignore'` skips the check entirely — see the configuration below for when that
+  is a reasonable trade and what it costs.
 
 ### A replicated cluster is not supported
 
@@ -102,14 +105,15 @@ these keys.
 ### How large a job can be
 
 A job's payload is one value, and an entry has to fit in one page of the server's
-cache — where the page bounds **the key and the value together**. The page size
-follows from `max_memory` spread across the shards, and on a default single-node
-server it is small: `strlen($key) + strlen($value)` reached **1,048,550 bytes on
-v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**, constant across key lengths.
-The key here is the queue's own (`{prefix}{queue}:job:{id}`), so nearly all of it
-is yours. A larger job fails at `push` with the server's generic `internal error`.
-Keep payloads small — pass ids, not models — or give the server fewer shards or
-more memory.
+cache — where the page bounds **the key and the value together**. On a default
+single-node server `strlen($key) + strlen($value)` reached **1,048,550 bytes on
+v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**, constant across key lengths;
+the key here is the queue's own (`{prefix}{queue}:job:{id}`), so nearly all of it
+is yours. It is a constant per deployment rather than a share of `max_memory`: a
+one-shard server measured **2,097,106** with a 32 MiB budget, and a 512 MiB server
+still measured 1,048,546 — fewer shards, bigger pages. A larger job fails at
+`push` with the server's generic `internal error`. Keep payloads small — pass ids,
+not models — or give the server fewer shards.
 
 ## Requirements
 

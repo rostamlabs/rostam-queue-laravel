@@ -44,7 +44,8 @@ class UnsafeQueueStore extends RuntimeException
             .'  - rostam v0.7.0-beta3 or newer, so the node can report evictions.'
             ."\n\n"
             .'The first two cannot be read off the wire - that part is your declaration. What can be read '
-            .'is a node that has already evicted live records, and this driver will not run on one.',
+            .'is a node that has already evicted live records, and this driver will not run on one unless '
+            .'on_evictions is set to "ignore".',
             $declared === null ? '' : sprintf(' (got "%s")', $declared),
         ));
     }
@@ -93,7 +94,8 @@ class UnsafeQueueStore extends RuntimeException
             .'life after the queue has moved past it - and a lease lasts retry_after, including the '
             .'lease of a worker that died holding it. With the shorter of the two on the tombstone, a '
             .'slot can be re-used while that lease is still held, and the job written into it is the '
-            .'one nothing comes back for.',
+            .'one nothing comes back for. (tombstone_ttl => 0 is the engine\'s "never expires", which '
+            .'is accepted: it is the safest setting and the one that keeps every killed slot for ever.)',
             $tombstoneTtl,
             $retryAfter,
         ));

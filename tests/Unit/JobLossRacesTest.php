@@ -754,6 +754,12 @@ class JobLossRacesTest extends TestCase
         $this->worker('producer')->laterRaw(1, self::job('self-moved'));
 
         $this->assertSame(['self-moved'], $this->drain($this->worker('healthy')));
+
+        // And the copy it left in the bucket goes with it: bucket payloads carry
+        // no TTL, and no sweep passes that second again to clean up after it.
+        $left = array_filter(array_keys($this->store->all()), static fn (string $key) => str_contains($key, ':d:'));
+
+        $this->assertSame([], array_values($left), 'the bucket copy outlived the push that moved it');
     }
 
     /**
@@ -822,6 +828,45 @@ class JobLossRacesTest extends TestCase
     }
 
     /**
+     * A clear kills the slots a push could still land in - the ones above the
+     * reader - and nothing else. Below the reader an empty slot is a job that
+     * finished, and a tombstone on it is a key invented for nothing: this walk
+     * starts at the redelivery cursor, which one long-running job pins in place,
+     * so "one tombstone per id since then" turned clearing an empty queue into
+     * tens of thousands of keys, each living a week, on an engine that evicts
+     * when it runs out of room.
+     */
+    public function test_clearing_does_not_invent_a_tombstone_for_every_finished_slot(): void
+    {
+        $operator = $this->worker('operator');
+        $operator->pushRaw(self::job('long-running'));
+
+        // Its lease pins the redelivery cursor at zero for as long as it runs.
+        $running = $this->worker('slow')->pop();
+        $this->assertNotNull($running);
+
+        for ($i = 0; $i < 50; $i++) {
+            $operator->pushRaw(self::job('finished-'.$i));
+        }
+
+        $worker = $this->worker('fast');
+
+        while ($job = $worker->pop()) {
+            $job->delete();
+        }
+
+        $this->assertSame(1, $operator->clear(), 'only the running job was still there to clear');
+
+        $slots = array_filter(array_keys($this->store->all()), static fn (string $key) => str_contains($key, ':job:'));
+
+        $this->assertLessThanOrEqual(
+            2,
+            count($slots),
+            'clear() left a tombstone on slots nothing can be written to: '.implode(', ', $slots)
+        );
+    }
+
+    /**
      * The gauge of a generation nobody can reach any more goes with the clear
      * that abandoned it, rather than sitting there for ever.
      */
@@ -836,6 +881,49 @@ class JobLossRacesTest extends TestCase
 
         $this->assertArrayNotHasKey('q:default:delayed:0', $this->store->all());
         $this->assertSame(0, $queue->delayedSize());
+    }
+
+    /**
+     * When a push moves its own job to the ready queue, the copy in the bucket
+     * goes with it. Bucket payloads carry no TTL, so one left behind is a key
+     * that outlives the queue.
+     */
+    public function test_a_push_that_moves_its_own_job_leaves_nothing_in_the_bucket(): void
+    {
+        $this->worker('warm-up')->pop();
+        $due = Carbon::now()->getTimestamp() + 1;
+
+        $this->client->before('increment', 'q:default:d:'.$due.':tail', function () use ($due) {
+            Carbon::setTestNow(Carbon::createFromTimestamp($due));
+            $this->worker('sweeper')->pop();
+        });
+
+        $this->worker('producer')->laterRaw(1, self::job('moved-by-its-push'));
+
+        $left = array_filter(array_keys($this->store->all()), static fn (string $key) => str_contains($key, ':d:'));
+
+        $this->assertSame([], array_values($left), 'the bucket copy was left behind');
+        $this->assertSame(['moved-by-its-push'], $this->drain($this->worker('healthy')));
+    }
+
+    /**
+     * Clearing moves the redelivery cursor up with the reader. Left behind, it
+     * would walk - and tombstone - the whole cleared range again on the next
+     * clear, and hand back anything that landed in it meanwhile.
+     */
+    public function test_clearing_moves_the_redelivery_cursor_too(): void
+    {
+        $queue = $this->worker('operator');
+
+        foreach (['a', 'b', 'c'] as $id) {
+            $queue->pushRaw(self::job($id));
+        }
+
+        $queue->clear();
+
+        $reclaim = unpack('J', (string) $this->store->get('q:default:reclaim'))[1];
+
+        $this->assertSame(3, $reclaim, 'the redelivery cursor stayed behind the clear');
     }
 
     /**

@@ -187,6 +187,11 @@ class RostamConnectorTest extends TestCase
         }
 
         $this->connect(['retry_after' => 600, 'tombstone_ttl' => 601]);
+
+        // Zero is the engine's "no expiry", so it outlives every lease there
+        // will ever be - the safest setting, and the one the guard used to
+        // refuse while telling the operator it was too short.
+        $this->assertSame(0, self::read($this->connect(['tombstone_ttl' => 0]), 'tombstoneTtl'));
     }
 
     /**

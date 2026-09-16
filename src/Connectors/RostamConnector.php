@@ -68,8 +68,9 @@ class RostamConnector implements ConnectorInterface
         // A killed slot has to outlive the lease of the worker that might still
         // be writing into it, or a slot killed while a lease was held comes back
         // to life under a lease nobody will release. Both are free settings; the
-        // relationship between them is not.
-        if ($tombstoneTtl <= $retryAfter) {
+        // relationship between them is not. Zero is the engine's "no expiry",
+        // which outlives everything - the safest setting, and the most memory.
+        if ($tombstoneTtl !== 0 && $tombstoneTtl <= $retryAfter) {
             throw UnsafeQueueStore::tombstonesOutliveLeases($tombstoneTtl, $retryAfter);
         }
 
