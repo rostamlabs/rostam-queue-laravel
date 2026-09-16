@@ -37,6 +37,29 @@ jobs:
 
       - run: vendor/bin/pint --test
 
+  mutation:
+    name: every fix still breaks something when removed
+    runs-on: ubuntu-latest
+
+    # The suite claims each fix is load-bearing. This is what makes that
+    # checkable rather than asserted: each mutant undoes one fix and the suite
+    # has to go red. It also fails when a mutant stops matching its source, so
+    # the campaign cannot quietly shrink as the code moves underneath it.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@a8d0d959dab41457692a5e2041bd9b757a119e3f # 3.2.1
+
+      - run: php tests/Mutation/run.php
+
   test:
     name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }} ${{ matrix.dependencies }}
     runs-on: ubuntu-latest

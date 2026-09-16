@@ -520,6 +520,68 @@ class JobLossRacesTest extends TestCase
     }
 
     /**
+     * Looking PAST a job still in flight is not the same as moving the cursor
+     * past it. The walk reads a window above the cursor and may redeliver
+     * anything settled in it, but the cursor itself stops at the first job that
+     * is still somebody's - otherwise the one slot it skipped is the one slot
+     * nothing will ever look at again, and the job dies with its worker.
+     */
+    public function test_the_redelivery_cursor_waits_behind_a_job_still_in_flight(): void
+    {
+        $producer = $this->worker('producer');
+        $producer->pushRaw(self::job('still-running'));
+        $producer->pushRaw(self::job('finished'));
+
+        $running = $this->worker('holds-it')->pop();          // slot 1, lease held
+        $done = $this->worker('finishes')->pop();             // its walk passes slot 1
+        $this->assertNotNull($running);
+        $this->assertNotNull($done);
+        $done->delete();
+
+        $reclaim = $this->store->get('q:default:reclaim');
+
+        $this->assertSame(
+            0,
+            $reclaim === null ? 0 : unpack('J', (string) $reclaim)[1],
+            'the cursor stepped over a job whose worker was still holding it'
+        );
+
+        $this->store->ageOut('q:default:lease:1');            // that worker dies
+
+        $back = $this->worker('rescuer')->pop();
+
+        $this->assertNotNull($back, 'nothing ever looked at the skipped slot again');
+        $this->assertSame('still-running', json_decode($back->getRawBody(), true)['id']);
+    }
+
+    /**
+     * The sweep kills a delayed slot that was drawn and never written, so the
+     * push behind it re-routes itself. That kill is a race of its own: the
+     * payload can land in the gap between the sweep reading the slot and
+     * killing it. Losing that race is how the sweep learns to look again - if
+     * it took its own kill for granted, the job it just stepped on would sit in
+     * a second no sweep returns to.
+     */
+    public function test_a_delayed_payload_landing_as_the_sweep_kills_its_slot_is_still_delivered(): void
+    {
+        $due = Carbon::now()->getTimestamp() + 1;
+
+        // A push that drew an id for this second and has not written yet.
+        $this->store->increment('q:default:d:'.$due.':tail');
+
+        $this->client->before('setNx', 'q:default:d:'.$due.':job:1', function () use ($due) {
+            $this->store->put('q:default:d:'.$due.':job:1', self::job('landed-late'));
+        });
+
+        Carbon::setTestNow(Carbon::createFromTimestamp($due));
+
+        $job = $this->worker('sweeper')->pop();
+
+        $this->assertNotNull($job, 'the sweep killed a slot whose payload had just landed');
+        $this->assertSame('landed-late', json_decode($job->getRawBody(), true)['id']);
+    }
+
+    /**
      * An idle queue used to leave a sealed counter behind for every second it
      * swept, each living a week. The seal is needed only until the watermark
      * passes its second.
