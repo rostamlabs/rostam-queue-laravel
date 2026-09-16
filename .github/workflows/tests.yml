@@ -1,0 +1,267 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The release workflow runs this whole file again, on the tagged commit.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style:
+    name: formatting
+    runs-on: ubuntu-latest
+
+    # Once, not per matrix entry. Pint's own rules move between releases, so
+    # asking the oldest allowed Pint to agree with the newest about the same
+    # file is a question with no answer rather than a finding.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@a8d0d959dab41457692a5e2041bd9b757a119e3f # 3.2.1
+
+      - run: vendor/bin/pint --test
+
+  mutation:
+    name: every fix still breaks something when removed
+    runs-on: ubuntu-latest
+
+    # The suite claims each fix is load-bearing. This is what makes that
+    # checkable rather than asserted: each mutant undoes one fix and the suite
+    # has to go red. It also fails when a mutant stops matching its source, so
+    # the campaign cannot quietly shrink as the code moves underneath it.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@a8d0d959dab41457692a5e2041bd9b757a119e3f # 3.2.1
+
+      - run: php tests/Mutation/run.php
+
+  test:
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }} ${{ matrix.dependencies }}
+    runs-on: ubuntu-latest
+
+    # A queue driver lives or dies by the framework contract it implements, and
+    # that contract moves - Queue gained pendingSize/delayedSize/reservedSize,
+    # and later queue routes, between the versions in this matrix. It is the
+    # framework versions the manifest claims, on the PHP versions each of them
+    # supports - and one lane on the LOWEST releases they resolve to, because
+    # "12.*" alone always installs the newest 12.x and never the contract the
+    # manifest actually promises to support.
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+        laravel: ['12.*', '13.*']
+        dependencies: [highest]
+        exclude:
+          # Laravel 13 requires PHP 8.3. The pair does not exist, so asking for
+          # it is not a gap in coverage - it is a job that can only ever fail.
+          - php: '8.2'
+            laravel: '13.*'
+        include:
+          - laravel: '12.*'
+            testbench: '10.*'
+          - laravel: '13.*'
+            testbench: '11.*'
+          - php: '8.2'
+            laravel: '12.*'
+            testbench: '10.*'
+            dependencies: lowest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: Pin the framework for this run
+        run: >
+          composer require --no-update --no-interaction --dev
+          "laravel/framework:${{ matrix.laravel }}"
+          "orchestra/testbench:${{ matrix.testbench }}"
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@a8d0d959dab41457692a5e2041bd9b757a119e3f # 3.2.1
+        with:
+          dependency-versions: ${{ matrix.dependencies }}
+
+      - name: Run the suite
+        run: vendor/bin/phpunit
+
+  conformance:
+    name: conformance against rostam-server (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+
+    # The suite's default target is a fake server written in PHP. A fake is a
+    # reimplementation of the protocol by the same hand that wrote the client,
+    # so a shared misreading of the wire would pass every test here and still
+    # fail in production. For a queue that matters twice over: the guarantee
+    # under test is that a job outlives the worker holding it, and a fake that
+    # expires leases differently would prove nothing about the real one.
+    #
+    # Against two servers. GitHub's releases/latest skips pre-releases, so the
+    # stable lane is the server people run today; while that predates the
+    # eviction count (v0.6.0 at the time of writing), it is where `headroom`
+    # must be refused on a real binary. The pre-release lane takes the highest
+    # version of any kind, where a clean node must run. Each test that needs
+    # one or the other skips by the version this job exports.
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, prerelease]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@a8d0d959dab41457692a5e2041bd9b757a119e3f # 3.2.1
+
+      - name: Fetch rostam-server (${{ matrix.channel }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/rostamlabs/rostam/releases?per_page=50" -o releases.json
+
+          # The HIGHEST version, not the newest by date. Picking by date, a patch
+          # published after a beta would hand the pre-release lane a stable
+          # server, and every beta-only test would skip without failing. Stable
+          # takes the highest release that is not a pre-release. The picker also
+          # names the asset and the checksums.txt of the SAME release.
+          picked=$(php -r '
+            $best = null;
+            foreach (json_decode(file_get_contents("releases.json"), true) as $release) {
+                if ($release["draft"] || (getenv("CHANNEL") === "stable" && $release["prerelease"])) {
+                    continue;
+                }
+                $assets = array_column($release["assets"], "browser_download_url", "name");
+                foreach ($assets as $asset => $download) {
+                    if (str_ends_with($asset, "linux_amd64.tar.gz")
+                        && ($best === null || version_compare(ltrim($release["tag_name"], "v"), ltrim($best[0], "v"), ">"))) {
+                        $best = [$release["tag_name"], $download, $asset, $assets["checksums.txt"] ?? ""];
+                    }
+                }
+            }
+            if ($best === null) { fwrite(STDERR, "no linux_amd64 release to test against\n"); exit(1); }
+            if ($best[3] === "") { fwrite(STDERR, "release {$best[0]} ships no checksums.txt\n"); exit(1); }
+            echo $best[1], " ", $best[2], " ", $best[3];
+          ')
+
+          # Split after the substitution, not with it: `set -- $(...)` reports
+          # set's own status, so a picker that exits non-zero would be missed by
+          # `set -e` and surface later as an unbound variable instead.
+          set -- $picked
+          url=$1 name=$2 sums=$3
+
+          echo "downloading $name"
+          curl -fsSL "$url" -o rostam.tar.gz
+          curl -fsSL "$sums" -o checksums.txt
+
+          # The one input this job does not get from a pinned source is the
+          # binary it then executes, so it is checked against the checksums the
+          # release publishes beside it.
+          expected=$(awk -v name="$name" '$2 == name || $2 == "*"name {print $1}' checksums.txt)
+          actual=$(sha256sum rostam.tar.gz | cut -d' ' -f1)
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::checksum mismatch for $name (expected '$expected', got '$actual')"
+            exit 1
+          fi
+
+          tar xzf rostam.tar.gz
+
+          # "rostam-server 0.7.0-beta6 (go1.26.5 linux/amd64)" -> 0.7.0-beta6.
+          # A version that does not read as one fails the job: tests gate on it,
+          # and a garbled one would make every newer-op test skip in silence.
+          version=$(./rostam-server --version | awk '{print $2}')
+          if ! printf '%s' "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::could not read a version from: $(./rostam-server --version)"
+            exit 1
+          fi
+          echo "rostam-server $version"
+          echo "ROSTAM_TEST_SERVER_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Start it on the binary TCP listener
+        run: |
+          set -euo pipefail
+          # -relocating-eviction is what the driver's declaration requires of an
+          # operator, so it is what this lane runs. It arrived after v0.6.0, and
+          # a server that does not know a flag refuses to start, so the stable
+          # lane goes without it until the stable release has it.
+          #
+          # The help text is captured first and searched after: under pipefail a
+          # `server | grep` pipeline reports the server's own exit status, so a
+          # future release that prints the flag and exits non-zero would be read
+          # as predating it - and this lane would then run the one setup the
+          # driver refuses, while printing the opposite.
+          help=$(./rostam-server -help-all 2>&1 || true)
+          relocating=-relocating-eviction
+          if ! printf '%s' "$help" | grep -q -- '-relocating-eviction'; then
+            relocating=
+            echo "this server predates -relocating-eviction"
+          fi
+          ./rostam-server -tcp 127.0.0.1:7411 -insecure $relocating &
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/7411) 2>/dev/null; then
+              echo "listening"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "the server never came up"; exit 1
+
+      - name: Run the suite against it
+        env:
+          ROSTAM_TEST_SERVER: 127.0.0.1:7411
+        run: vendor/bin/phpunit
+
+      # Producers and workers as separate processes, workers killed at random
+      # instants, then every accepted job must have been FINISHED - not merely
+      # handed out. The seed is printed, so a failure here can be replayed with
+      # CHAOS_SEED.
+      #
+      # --fail-on-skipped, and only here: the test skips itself when the SERVER
+      # evicted during the run, because then it is measuring the engine rather
+      # than the queue - but a skip exits 0, and a gate that passes when the
+      # thing it guards could not be checked is not a gate. The stable lane runs
+      # without -relocating-eviction, so this is a live possibility, not a
+      # hypothetical.
+      - name: Kill workers at random and count every job
+        env:
+          ROSTAM_TEST_SERVER: 127.0.0.1:7411
+        run: vendor/bin/phpunit --fail-on-skipped tests/Chaos/ChaosTest.php
