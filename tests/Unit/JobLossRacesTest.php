@@ -883,6 +883,16 @@ class JobLossRacesTest extends TestCase
 
         $drawn = $this->store->increment('q:default:tail');   // slot 2: drawn, never written
 
+        // The arrangement IS the test: with both slots on the same side of the
+        // reader, every assertion below still passes against a clear that kills
+        // only one side. So it is asserted rather than assumed.
+        $this->assertSame(2, $drawn);
+        $this->assertSame(
+            1,
+            unpack('J', (string) $this->store->get('q:default:head'))[1],
+            'the reader must sit between the two slots or this test stops discriminating'
+        );
+
         $this->assertSame(1, $operator->clear(), 'only the abandoned job was there to count');
 
         $this->assertSame(
@@ -899,6 +909,43 @@ class JobLossRacesTest extends TestCase
         // And that push, arriving late, finds its slot taken and re-routes.
         $this->assertFalse($this->store->setNx('q:default:job:'.$drawn, self::job('straggler')));
         $this->assertSame([], $this->drain($this->worker('healthy')), 'a cleared job came back');
+    }
+
+    /**
+     * clear() reads a batch of slots and then decides, per slot, which side of
+     * the reader it is on. Walking a counter beside the answer would assume the
+     * client hands the batch back in the order it was asked for - true of both
+     * clients that ship today, and a job left alive behind the reader the day
+     * one stops. The answer is looked up by key instead, and this pins that.
+     */
+    public function test_clearing_survives_a_client_that_answers_a_batch_in_another_order(): void
+    {
+        $shuffling = new class($this->store) extends InterleavingClient
+        {
+            public function getMany(array $keys): array
+            {
+                return array_reverse(parent::getMany($keys), true);
+            }
+        };
+
+        $operator = new RostamQueue($shuffling, 'q:', 'default', retryAfter: 30, owner: 'operator');
+        $operator->setContainer(new Container);
+        $operator->setConnectionName('rostam');
+
+        $operator->pushRaw(self::job('worker-died-holding-it'));
+        $this->worker('dies')->pop();
+        $this->everyWorkerIsGone();
+
+        $drawn = $this->store->increment('q:default:tail');
+
+        $operator->clear();
+
+        $this->assertSame(
+            RostamQueue::TOMBSTONE,
+            $this->store->get('q:default:job:'.$drawn),
+            'a reordered answer left the slot an unwritten push had drawn alive'
+        );
+        $this->assertSame(RostamQueue::TOMBSTONE, $this->store->get('q:default:job:1'));
     }
 
     /**
