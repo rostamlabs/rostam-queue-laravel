@@ -137,7 +137,14 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
      */
     public function size($queue = null): int
     {
-        return $this->pendingSize($queue) + $this->delayedSize($queue);
+        $queue = $this->queueName($queue);
+
+        // Both answers in two round trips rather than four: the writer, the
+        // reader and the delayed generation together, then the gauge that
+        // generation names.
+        [$tail, $head, $generation] = $this->counters($queue, 'tail', 'head', 'dgen');
+
+        return max(0, $tail - $head) + $this->gauge($queue, $generation);
     }
 
     /**
@@ -150,8 +157,9 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     public function pendingSize($queue = null): int
     {
         $queue = $this->queueName($queue);
+        [$tail, $head] = $this->counters($queue, 'tail', 'head');
 
-        return max(0, $this->tail($queue)->value() - $this->head($queue)->value());
+        return max(0, $tail - $head);
     }
 
     /**
@@ -164,9 +172,8 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     public function delayedSize($queue = null): int
     {
         $queue = $this->queueName($queue);
-        $raw = $this->client->get($this->gaugeKey($queue, $this->delayedGeneration($queue)));
 
-        return ($raw !== null && strlen($raw) === 8) ? max(0, unpack('J', $raw)[1]) : 0;
+        return $this->gauge($queue, $this->delayedGeneration($queue));
     }
 
     /**
@@ -195,9 +202,9 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     public function creationTimeOfOldestPendingJob($queue = null): ?int
     {
         $queue = $this->queueName($queue);
-        $at = $this->head($queue)->value();
+        [$at, $tail] = $this->counters($queue, 'head', 'tail');
 
-        if ($at >= $this->tail($queue)->value()) {
+        if ($at >= $tail) {
             return null;
         }
 
@@ -346,66 +353,85 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         $this->redeliverAbandonedJobs($queue);
 
         $head = $this->head($queue);
-        $tail = $this->tail($queue);
         $killed = 0;
 
-        for ($step = 0; $step < self::MAX_STEPS; $step++) {
-            $at = $head->value();
+        // The reader and the writer in one round trip. After that, a worker
+        // that moved the reader itself knows where it stands - one past where
+        // it was - and reads both again only when a move was not its own, or
+        // when what it knows says the queue is empty.
+        [$at, $end] = $this->counters($queue, 'head', 'tail');
+        $fresh = true;
 
-            if ($at >= $tail->value()) {
-                return null;
+        for ($step = 0; $step < self::MAX_STEPS; $step++) {
+            if ($at >= $end) {
+                if ($fresh) {
+                    return null;
+                }
+
+                [$at, $end] = $this->counters($queue, 'head', 'tail');
+                $fresh = true;
+
+                continue;
             }
 
             $id = $at + 1;
             $key = $this->jobKey($queue, $id);
+            $reservation = $this->reservation($queue, $id);
+
+            // The lease first, the payload after - read under the lease, so no
+            // other worker can claim, finish and let go of this job between the
+            // look and the claim. Holding a lease on a job that is already done
+            // would run it twice. A slot that turns out empty or killed costs
+            // the lease back; that is the rare path, and on the common one the
+            // read under the lease is the only read.
+            //
+            // The cursor moves whether or not this worker won the lease: the
+            // slot has been dealt with either way, and the loser must not sit
+            // on it.
+            if (! $reservation->take($this->retryAfter)) {
+                [$at, $end, $fresh] = $this->stepPast($queue, $head, $at, $end);
+
+                continue;
+            }
+
             $payload = $this->client->get($key);
 
             if ($payload === null) {
                 // Either a push still on its way, or a record that vanished.
                 // Kill the slot atomically: if this wins, the push - if there
                 // is one - finds it taken and draws another id; if it loses,
-                // the payload has just landed and is read again.
+                // the payload has just landed, and this worker still holds the
+                // lease on it.
                 //
                 // Counted as a hole only when this worker is also the one that
                 // moves past it. A worker reading a stale head can reach a slot
                 // another worker already claimed and finished; killing that
                 // empty slot is harmless, but it was never a hole.
-                if ($this->client->setNx($key, self::TOMBSTONE, $this->tombstoneTtl) && $head->advanceFrom($at)) {
-                    $this->holes[$queue] = ($this->holes[$queue] ?? 0) + 1;
+                if ($this->client->setNx($key, self::TOMBSTONE, $this->tombstoneTtl)) {
+                    $reservation->release();
 
-                    if (++$killed >= self::HOLE_RUN) {
-                        throw JobVanished::tooManyHoles($queue, $killed);
+                    if ($head->advanceFrom($at)) {
+                        $this->holes[$queue] = ($this->holes[$queue] ?? 0) + 1;
+
+                        if (++$killed >= self::HOLE_RUN) {
+                            throw JobVanished::tooManyHoles($queue, $killed);
+                        }
+
+                        [$at, $fresh] = [$at + 1, false];
+                    } else {
+                        [$at, $end] = $this->counters($queue, 'head', 'tail');
+                        $fresh = true;
                     }
+
+                    continue;
                 }
 
-                continue;
+                $payload = $this->client->get($key);
             }
 
-            if ($payload === self::TOMBSTONE) {
-                $head->advanceFrom($at);
-
-                continue;
-            }
-
-            $reservation = $this->reservation($queue, $id);
-
-            // The cursor moves whether or not this worker won the lease: the
-            // slot has been dealt with either way, and the loser must not sit
-            // on it.
-            if (! $reservation->take($this->retryAfter)) {
-                $head->advanceFrom($at);
-
-                continue;
-            }
-
-            // Between reading the payload and taking the lease, another worker
-            // may have claimed this job, finished it and let its lease go.
-            // Holding a lease on a job that is already done would run it twice.
-            $current = $this->client->get($key);
-
-            if ($current === null || $current === self::TOMBSTONE) {
+            if ($payload === null || $payload === self::TOMBSTONE) {
                 $reservation->release();
-                $head->advanceFrom($at);
+                [$at, $end, $fresh] = $this->stepPast($queue, $head, $at, $end);
 
                 continue;
             }
@@ -413,13 +439,32 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
             $head->advanceFrom($at);
 
             return new RostamJob(
-                $this->container, $this, $current, $this->connectionName, $name, $id, $reservation,
+                $this->container, $this, $payload, $this->connectionName, $name, $id, $reservation,
             );
         }
 
         // Every step lost a race to another worker. That worker has the job;
         // this one comes back on its next poll.
         return null;
+    }
+
+    /**
+     * Move the reader past a slot this worker is done with, and say where that
+     * leaves it: one past, when the move was its own; wherever the reader and
+     * writer stand now, read again, when another worker moved first.
+     *
+     * @return array{0: int, 1: int, 2: bool} the reader, the writer, and
+     *                                        whether both were just read
+     */
+    private function stepPast(string $queue, Cursor $head, int $at, int $end): array
+    {
+        if ($head->advanceFrom($at)) {
+            return [$at + 1, $end, false];
+        }
+
+        [$at, $end] = $this->counters($queue, 'head', 'tail');
+
+        return [$at, $end, true];
     }
 
     /**
@@ -461,6 +506,7 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         $payloads = $this->client->getMany($jobKeys);
         $leases = $this->client->getMany($leaseKeys);
         $settledSoFar = true;
+        $settledUpTo = $start;
 
         foreach ($ids as $index => $id) {
             $payload = $payloads[$jobKeys[$index]] ?? null;
@@ -479,8 +525,19 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
             }
 
             if ($settledSoFar) {
-                $cursor->advanceFrom($id - 1);
+                $settledUpTo = $id;
             }
+        }
+
+        // One move across the whole settled run, not one compare-and-swap per
+        // slot. That makes $settledSoFar the guard that keeps the cursor behind
+        // a job still in flight: the jump lands on the last slot of an unbroken
+        // run, and nothing past a gap. Settled slots stay settled - nothing is
+        // ever written below the reader again - so if another worker moved the
+        // cursor meanwhile, carrying it on to the same slot is still safe, and
+        // advanceTo() never takes it back.
+        if ($settledUpTo > $start && ! $cursor->advanceFromTo($start, $settledUpTo)) {
+            $cursor->advanceTo($settledUpTo);
         }
     }
 
@@ -656,24 +713,38 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
             return;
         }
 
-        $cursor = new Cursor($this->client, $this->key($queue, 'swept'));
+        $done = $swept;
 
         for ($second = $swept + 1; $second <= $until; $second++) {
             if (! $this->migrateSecond($queue, $second)) {
                 // A job in this second belongs to another worker's move. Stop
                 // here rather than mark the second done under it.
-                return;
+                break;
             }
 
-            $cursor->advanceTo($second);
-
-            // The seal was needed only until the watermark passed this second.
-            // From here a push that draws an id for it - even a fresh one - sees
-            // the watermark after storing and moves its own job. Deleting it
-            // keeps the keyspace to the seconds still ahead; a worker dying
-            // right here leaves one sealed counter behind.
-            $this->client->del($this->bucketTailKey($queue, $second));
+            $done = $second;
         }
+
+        if ($done === $swept) {
+            return;
+        }
+
+        // The watermark moves once, past the whole run, rather than once per
+        // second. Every second in the run is sealed, so a push that draws an id
+        // for one of them before the watermark arrives carries SEALED and goes
+        // to the ready queue - the watermark has nothing to cover meanwhile.
+        (new Cursor($this->client, $this->key($queue, 'swept')))->advanceTo($done);
+
+        // The seals were needed only until the watermark passed their seconds.
+        // From here a push that draws an id for one - even a fresh one - sees
+        // the watermark after storing and moves its own job. Deleting them
+        // keeps the keyspace to the seconds still ahead; a worker dying right
+        // here leaves sealed counters behind, and a later sweep reads each one
+        // as the count it holds.
+        $this->client->delMany(array_map(
+            fn (int $second) => $this->bucketTailKey($queue, $second),
+            range($swept + 1, $done),
+        ));
     }
 
     /**
@@ -768,6 +839,15 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
     protected function seal(string $queue, int $second): int
     {
         $key = $this->bucketTailKey($queue, $second);
+
+        // Most seconds hold no delayed job at all, and for those the seal is
+        // one op: create the counter already sealed. It is atomic like the
+        // compare-and-swap below - a push drawing an id afterwards gets
+        // SEALED back - and losing it means a push got there first, which the
+        // loop then seals around.
+        if ($this->client->setNx($key, pack('J', self::SEALED))) {
+            return 0;
+        }
 
         while (true) {
             $raw = $this->client->get($key);
@@ -886,6 +966,33 @@ class RostamQueue extends Queue implements ClearableQueue, QueueContract
         $raw = $this->client->get($this->key($queue, 'dgen'));
 
         return ($raw !== null && strlen($raw) === 8) ? unpack('J', $raw)[1] : 0;
+    }
+
+    /**
+     * Several of a queue's counters in one round trip, in the order named.
+     *
+     * The client pipelines them on one connection, which the server answers
+     * strictly in order, so they are read in that order - the same as reading
+     * them one by one, without waiting between.
+     *
+     * @return list<int>
+     */
+    protected function counters(string $queue, string ...$parts): array
+    {
+        $keys = array_map(fn (string $part) => $this->key($queue, $part), $parts);
+        $stored = $this->client->getMany($keys);
+
+        return array_map(static fn (string $key) => Cursor::decode($stored[$key] ?? null), $keys);
+    }
+
+    /**
+     * How many delayed jobs one generation holds; never below zero.
+     */
+    protected function gauge(string $queue, int $generation): int
+    {
+        $raw = $this->client->get($this->gaugeKey($queue, $generation));
+
+        return ($raw !== null && strlen($raw) === 8) ? max(0, unpack('J', $raw)[1]) : 0;
     }
 
     protected function head(string $queue): Cursor

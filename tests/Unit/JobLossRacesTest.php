@@ -419,7 +419,9 @@ class JobLossRacesTest extends TestCase
         Carbon::setTestNow(Carbon::now()->addSecond());
         $second = Carbon::now()->getTimestamp();
 
-        $this->client->before('get', 'q:default:d:'.$second.':tail', function () {
+        // Whichever op the sweep opens the second with: a `set_nx` that seals an
+        // empty one in one step, or the read before a compare-and-swap.
+        $this->client->before('get|setNx', 'q:default:d:'.$second.':tail', function () {
             $this->worker('operator')->clear();
             $this->worker('producer')->laterRaw(0, self::job('after-clear'));
         });
@@ -760,7 +762,9 @@ class JobLossRacesTest extends TestCase
 
         $stale = $this->worker('stale');
 
-        $this->client->before('get', 'q:default:job:1', function () {
+        // The first thing a worker does at a slot is take its lease, so that is
+        // where the slower one arrives after the faster has come and gone.
+        $this->client->before('setNx', 'q:default:lease:1', function () {
             if ($job = $this->worker('fast')->pop()) {
                 $job->delete();
             }

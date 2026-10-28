@@ -26,8 +26,10 @@ return [
         'id' => 'M01',
         'why' => 'a pop that steps over an empty slot without killing it lets a slow push land behind the reader',
         'file' => 'src/RostamQueue.php',
-        'find' => 'if ($this->client->setNx($key, self::TOMBSTONE, $this->tombstoneTtl) && $head->advanceFrom($at)) {',
-        'replace' => 'if ($head->advanceFrom($at)) {',
+        'find' => '                if ($this->client->setNx($key, self::TOMBSTONE, $this->tombstoneTtl)) {
+                    $reservation->release();',
+        'replace' => '                if (true) {
+                    $reservation->release();',
     ],
     [
         'id' => 'M02',
@@ -38,22 +40,22 @@ return [
     ],
     [
         'id' => 'M03',
-        'why' => 'without the re-read under the lease, a job finished between the look and the lease runs twice',
+        'why' => 'a payload read before the lease is taken lets a job finished between the look and the lease run twice',
         'file' => 'src/RostamQueue.php',
-        'find' => '            $current = $this->client->get($key);',
-        'replace' => '            $current = $payload;',
-    ],
-    [
-        'id' => 'M04',
-        'why' => 'skipping a tombstone early saves a lease; it is not what stops one being handed out. '
-            .'The read again under the lease sees the tombstone too and lets the slot go, so removing this '
-            .'costs a round trip rather than a wrong delivery - M03 takes the guard that matters',
-        'file' => 'src/RostamQueue.php',
-        'find' => '            if ($payload === self::TOMBSTONE) {
-                $head->advanceFrom($at);',
-        'replace' => '            if (false) {
-                $head->advanceFrom($at);',
-        'expect' => 'survives',
+        'find' => '            if (! $reservation->take($this->retryAfter)) {
+                [$at, $end, $fresh] = $this->stepPast($queue, $head, $at, $end);
+
+                continue;
+            }
+
+            $payload = $this->client->get($key);',
+        'replace' => '            $payload = $this->client->get($key);
+
+            if (! $reservation->take($this->retryAfter)) {
+                [$at, $end, $fresh] = $this->stepPast($queue, $head, $at, $end);
+
+                continue;
+            }',
     ],
 
     // ---- reclaim: the window and its cursor ------------------------------
@@ -73,15 +75,24 @@ return [
     ],
     [
         'id' => 'M06b',
-        'why' => '$settledSoFar saves round trips; it is not what keeps the cursor behind an unsettled slot. '
-            .'An unsettled id returns before reaching this line, and advanceFrom() is a compare-and-swap from '
-            .'the slot below, so the cursor can only ever step, never jump over one. Both guards have to go '
-            .'before anything is lost - M06 takes the one that matters',
+        'why' => 'the cursor crosses the whole settled run in one jump, so $settledSoFar is what ends the run at the '
+            .'first job still in flight; without it the jump lands past that job and nothing looks at it again',
         'file' => 'src/RostamQueue.php',
         'find' => '            if ($settledSoFar) {
-                $cursor->advanceFrom($id - 1);',
+                $settledUpTo = $id;',
         'replace' => '            if (true) {
-                $cursor->advanceFrom($id - 1);',
+                $settledUpTo = $id;',
+    ],
+    [
+        'id' => 'M06c',
+        'why' => 'the fallback only carries the cursor on when another worker moved it during the walk; without it '
+            .'the cursor stays where that worker left it, and the next pop walks the same settled slots again. '
+            .'Round trips, not jobs',
+        'file' => 'src/RostamQueue.php',
+        'find' => '        if ($settledUpTo > $start && ! $cursor->advanceFromTo($start, $settledUpTo)) {
+            $cursor->advanceTo($settledUpTo);',
+        'replace' => '        if ($settledUpTo > $start && ! $cursor->advanceFromTo($start, $settledUpTo)) {
+            // no fallback',
         'expect' => 'survives',
     ],
 
@@ -155,6 +166,14 @@ return [
         'file' => 'src/RostamQueue.php',
         'find' => '            if (! $this->migrateSecond($queue, $second)) {',
         'replace' => '            if (false) {',
+    ],
+    [
+        'id' => 'M14b',
+        'why' => 'an empty second created UNSEALED lets a push draw an id the sweep counted as none, store its job '
+            .'while the watermark is still behind, and find nobody coming back for it',
+        'file' => 'src/RostamQueue.php',
+        'find' => "if (\$this->client->setNx(\$key, pack('J', self::SEALED))) {",
+        'replace' => "if (\$this->client->setNx(\$key, pack('J', 0))) {",
     ],
     [
         'id' => 'M15',
