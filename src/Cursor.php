@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace Rostam\Queue;
 
+use InvalidArgumentException;
 use Rostam\Contracts\KvClient;
 
 /**
@@ -66,7 +67,29 @@ final class Cursor
      */
     public function advanceFrom(int $from): bool
     {
-        $next = pack('J', $from + 1);
+        return $this->advanceFromTo($from, $from + 1);
+    }
+
+    /**
+     * Move from $from straight to $to, and report whether this caller did it.
+     *
+     * The same compare as advanceFrom(), for a caller that has checked every
+     * slot in between itself and would otherwise spend one compare-and-swap
+     * per slot to cross them.
+     *
+     * Forward only, like advanceTo(): a target at or behind $from would drag
+     * a reading cursor back over slots already dealt with, so it is refused
+     * outright rather than left to the caller to guard.
+     *
+     * @throws InvalidArgumentException when $to is not past $from
+     */
+    public function advanceFromTo(int $from, int $to): bool
+    {
+        if ($to <= $from) {
+            throw new InvalidArgumentException("a cursor only moves forward: cannot go from {$from} to {$to}");
+        }
+
+        $next = pack('J', $to);
 
         if ($from !== 0) {
             return $this->client->cas($this->key, $next, pack('J', $from));
@@ -104,7 +127,11 @@ final class Cursor
         return $this->key;
     }
 
-    private static function decode(?string $raw): int
+    /**
+     * A counter's stored bytes as a position: absent and malformed read as 0.
+     * Public for readers that fetch several counters in one round trip.
+     */
+    public static function decode(?string $raw): int
     {
         if ($raw === null || strlen($raw) !== 8) {
             return 0;

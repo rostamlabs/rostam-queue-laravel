@@ -6,6 +6,8 @@ declare(strict_types=1);
 
 namespace Rostam\Queue\Tests\Unit;
 
+use InvalidArgumentException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Rostam\Queue\Cursor;
 use Rostam\Testing\ArrayKvClient;
@@ -59,6 +61,51 @@ class CursorTest extends TestCase
         $cursor->advanceTo(4);
 
         $this->assertSame(10, $cursor->value());
+    }
+
+    public function test_it_jumps_a_checked_run_in_one_move(): void
+    {
+        $client = new ArrayKvClient;
+        $cursor = new Cursor($client, 'c');
+
+        $this->assertTrue($cursor->advanceFromTo(0, 5));
+        $this->assertTrue($cursor->advanceFromTo(5, 9));
+        $this->assertSame(9, $cursor->value());
+    }
+
+    public function test_a_jump_from_a_stale_position_does_not_move_it(): void
+    {
+        $client = new ArrayKvClient;
+        $cursor = new Cursor($client, 'c');
+        $cursor->advanceTo(7);
+
+        $this->assertFalse($cursor->advanceFromTo(3, 12), 'a caller that read 3 moved a cursor standing at 7');
+        $this->assertSame(7, $cursor->value());
+    }
+
+    /** @return array<string, array{int, int}> */
+    public static function targetsThatAreNotAhead(): array
+    {
+        return [
+            'behind' => [8, 5],
+            'the same slot' => [8, 8],
+        ];
+    }
+
+    #[DataProvider('targetsThatAreNotAhead')]
+    public function test_a_jump_never_moves_it_back(int $from, int $to): void
+    {
+        $client = new ArrayKvClient;
+        $cursor = new Cursor($client, 'c');
+        $cursor->advanceTo($from);
+
+        try {
+            $cursor->advanceFromTo($from, $to);
+            $this->fail('a jump to a target that is not ahead was accepted');
+        } catch (InvalidArgumentException) {
+        }
+
+        $this->assertSame($from, $cursor->value());
     }
 
     /** Nothing to do is nothing written - which is how clear() stopped storing an explicit zero. */
