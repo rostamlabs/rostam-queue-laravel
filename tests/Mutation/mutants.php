@@ -96,6 +96,15 @@ return [
         'expect' => 'survives',
     ],
 
+    [
+        'id' => 'M06d',
+        'why' => 'a jump to a target that is not ahead drags a reading cursor back over slots already dealt with; '
+            .'the only caller guards it today, so the method has to refuse it for the next one',
+        'file' => 'src/Cursor.php',
+        'find' => '        if ($to <= $from) {',
+        'replace' => '        if (false) {',
+    ],
+
     // ---- redelivery: putting an abandoned job back -----------------------
     [
         'id' => 'M07',

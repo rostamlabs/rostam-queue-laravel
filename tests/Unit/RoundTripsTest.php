@@ -88,7 +88,7 @@ class RoundTripsTest extends TestCase
         $this->assertSame(['getMany'], array_column($ops, 0));
     }
 
-    public function test_claiming_a_waiting_job_costs_four_round_trips(): void
+    public function test_a_pop_that_claims_a_waiting_job_costs_seven_round_trips_four_of_them_the_claim(): void
     {
         $queue = $this->queue();
         $queue->pop();                                   // pins the sweep watermark

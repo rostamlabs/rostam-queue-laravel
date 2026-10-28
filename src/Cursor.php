@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 namespace Rostam\Queue;
 
+use InvalidArgumentException;
 use Rostam\Contracts\KvClient;
 
 /**
@@ -75,9 +76,19 @@ final class Cursor
      * The same compare as advanceFrom(), for a caller that has checked every
      * slot in between itself and would otherwise spend one compare-and-swap
      * per slot to cross them.
+     *
+     * Forward only, like advanceTo(): a target at or behind $from would drag
+     * a reading cursor back over slots already dealt with, so it is refused
+     * outright rather than left to the caller to guard.
+     *
+     * @throws InvalidArgumentException when $to is not past $from
      */
     public function advanceFromTo(int $from, int $to): bool
     {
+        if ($to <= $from) {
+            throw new InvalidArgumentException("a cursor only moves forward: cannot go from {$from} to {$to}");
+        }
+
         $next = pack('J', $to);
 
         if ($from !== 0) {
